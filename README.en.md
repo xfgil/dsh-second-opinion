@@ -13,7 +13,6 @@ English | [中文](README.md)
 | [`dsh-game-guard`](https://github.com/xfgil/dsh-game-guard) — quiet down while gaming |
 | [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) — edit plugin source without restarting |
 | [`dsh-session-clock`](https://github.com/xfgil/dsh-session-clock) — per-session clock and idle gaps |
-| [`dsh-session-coop`](https://github.com/xfgil/dsh-session-coop) — a shared board between sessions |
 | **`dsh-second-opinion`** — ask another session for a second opinion when stuck (this repo) |
 | [`dsh-onebot-companion`](https://github.com/xfgil/dsh-onebot-companion) — QQ channel all-in-one: outbound gate, rules, rhythm, persona, voice |
 
@@ -44,7 +43,6 @@ DSH already has cross-session messaging, but neither existing route can do this:
 | --- | --- | --- | --- |
 | `sessionController.prompt` | ✅ auto-resumes | **"the user said this"** | It hardcodes the message source as `kind: "user"` (`const source = { kind: "user", rpcId: request.requestId, ... }` inside `@deepseek-ai/dsh-api-session-controller`) — **impersonating the user**, unacceptable |
 | `send_message` | ✅ starts a turn | `agent-message · relay` | Authorization restricts it to the **parent/child chain** (`dsh-subagent` compares `session.header.parentSession`); it cannot reach two sibling sessions |
-| [`dsh-session-coop`](https://github.com/xfgil/dsh-session-coop)'s `coop_post` | ❌ injects only, never wakes | A board message | The injection point is `agent/pre-step`, so it **can only wait for the peer to take a step**; it cannot wake a sleeping session |
 
 **The gap = arbitrary session pair + can wake + does not impersonate the user** —
 a combination the host does not provide.

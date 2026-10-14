@@ -13,7 +13,6 @@
 | [`dsh-game-guard`](https://github.com/xfgil/dsh-game-guard) — 游戏时收起打扰面 |
 | [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) — 改完插件源码不用重启 |
 | [`dsh-session-clock`](https://github.com/xfgil/dsh-session-clock) — 按会话授时与空闲间隔 |
-| [`dsh-session-coop`](https://github.com/xfgil/dsh-session-coop) — 会话之间的协同板 |
 | **`dsh-second-opinion`** — 卡住时找另一个会话要第二意见（本仓库） |
 | [`dsh-onebot-companion`](https://github.com/xfgil/dsh-onebot-companion) — QQ 通道一体化：出站沉默守卫 / 行为规则 / 对话节奏 / 人设 / 语音 |
 
@@ -43,7 +42,6 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 | --- | --- | --- | --- |
 | `sessionController.prompt` | ✅ 自动 resume | **「用户本人发言」** | 它把消息来源硬编码成 `kind: "user"`（`@deepseek-ai/dsh-api-session-controller` 内 `const source = { kind: "user", rpcId: request.requestId, ... }`）——**冒充用户**，不可接受 |
 | `send_message` | ✅ 起新 turn | `agent-message · relay` | 授权档位把它限制在**父子链**上（`dsh-subagent` 里比对 `session.header.parentSession`），够不着两个平级会话 |
-| [`dsh-session-coop`](https://github.com/xfgil/dsh-session-coop) 的 `coop_post` | ❌ 只注入不唤醒 | 协同板消息 | 注入点在 `agent/pre-step`，**只能等对方开步**，叫不醒睡着的会话 |
 
 **缺口 = 跨任意会话 + 能唤醒 + 不冒充用户**——这三项组合宿主没有提供。
 
