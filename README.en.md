@@ -30,8 +30,11 @@ assumptions, reads the problem fresh, and says "your third assumption is wrong."
 This plugin provides that view for the cost of one tool call:
 
 ```
-A is stuck → calls ask_advisor → plugin creates/reuses advisor session B → B analyzes → answer returns to A
+A is stuck → calls ask_advisor → the plugin creates an advisor dedicated to A (titled "辅助" + A's first three characters) → B analyzes → answer returns to A
 ```
+
+Every asking session gets **its own** advisor (sessions that never ask are never given one);
+to have the same question thought through by a second independent session, pass `advisor: 2`.
 
 ---
 
@@ -75,7 +78,7 @@ spin while waiting.
                                           ┌─────────────────┐
                                           │  Advisor B       │
                                           │ (auto-created,   │
-                                          │  reused)         │
+                                          │  one per caller) │
                                           └─────────────────┘
 ```
 
@@ -83,16 +86,17 @@ Four implementation decisions that matter:
 
 1. **Answer boundaries come from a `session.seq` snapshot.** The advisor's log length
    is recorded **before** delivering, and only the events appended afterwards are read.
-   Even though the advisor session is reused across many consults, you only ever get this
+   Even though an advisor session is consulted many times, you only ever get this
    consult's answer — never a previous one's.
 2. **Answer extraction follows the host's own rule.** `extractAnswer` in
    `lib/compose.js` mirrors `finalAssistantOutput` from `@deepseek-ai/dsh-subagent`:
    take the **last non-empty** assistant message; empty-content messages (recorded for
    accounting) must not overwrite earlier output. So when the advisor emits text and then
    a tool-only empty message, the text survives.
-3. **One advisor is serialized.** If two sessions consult the same advisor at once, the
-   second one's answer boundary overlaps the first's and it reads someone else's reply.
-   A per-advisor promise chain queues concurrent requests.
+3. **Each advisor slot is serialized.** Every asking session has its own advisor, but one
+   slot can still be consulted concurrently (two tool calls in the same session, or a
+   subagent it spawned). The answer boundary of the later request would then overlap the
+   earlier one and read someone else's reply. A per-advisor promise chain queues them.
 4. **Waiting polls `agent.status` rather than trusting `whenIdle()` alone.** The host's
    `wakeDriver` **returns early without creating a new `activityDone`** when the agent is
    already not idle (`if (this.phase.kind !== "idle") { ... return; }` in
@@ -136,13 +140,14 @@ Hands a stuck problem to an independent advisor session.
 | `situation` | ⭕ | Where you are stuck: what you were doing, what you expected, what happened |
 | `tried` | ⭕ | What you already attempted and why each failed. **This is the most valuable part** — it stops the advisor from repeating your dead ends |
 | `context` | ⭕ | Relevant raw context: file paths, code snippets, error messages |
+| `advisor` | ⭕ | Which advisor to use, `1` by default. Pass `2`, `3`, … to have the **same question** thought through again by a completely **independent** session. Each slot is a separate advisor session; they do not know the others exist |
 
 Returns:
 
 ```json
 {
   "ok": true,
-  "advisor": { "sessionId": "session-...", "cwd": "D:\\...\\your working directory" },
+  "advisor": { "sessionId": "session-...", "title": "辅助正则匹", "slot": 1, "cwd": "D:\\...\\your working directory" },
   "elapsedMs": 48213,
   "timedOut": false,
   "answer": "...the advisor's full reply..."
@@ -155,14 +160,39 @@ conversation.
 
 ### `advisor_status`
 
-Inspects the advisor session, or resets it when it misbehaves.
+Inspects **this session's** advisors, or resets them.
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `reset` | ⭕ | `true` discards the current advisor record; the next consult **creates** a new one (the old session itself is not deleted) |
+| `reset` | ⭕ | `true` discards **this session's** advisor records; the next consult **creates** new ones (the old sessions themselves are not deleted) |
+| `all` | ⭕ | `true` also lists the advisors of every asking session |
 
-Returns `advisorSessionId` / `cwd` / `live` / `consults` / `lastConsultAt` /
-`createdAt` / `stateFile`.
+Returns `callerSessionId` / `callerTitle` / `advisors` (array; each entry has `slot`,
+`sessionId`, `title`, `cwd`, `live`, `consults`, `lastConsultAt`, `createdAt`) /
+`droppedAdvisorSessionIds` / `legacyAdvisorSessionId` / `maxAdvisors` / `stateFile`.
+
+### How advisor sessions are named
+
+The plugin titles each advisor session as **`辅助` + the first three characters of the
+asking session's title** (change the prefix with `advisorLabel`). The 2nd, 3rd … advisor
+of the same asking session gets its slot number appended:
+
+| Asking session title | Slot | Advisor title |
+| --- | --- | --- |
+| 正则匹配不上 | 1 | 辅助正则匹 |
+| 正则匹配不上 | 2 | 辅助正则匹2 |
+| 真 | 1 | 辅助真 |
+
+So at a glance in the session list you can tell which advisor serves whom.
+
+Two details: before the asking session has a title (a fresh session's first turn) the
+plugin falls back to the **first few characters of its session id** rather than leaving it
+blank; and if the asking session is later renamed, the next consult **updates the advisor
+title along with it** (only written when it actually differs, so a consult does not append
+an event every single time).
+
+Naming goes through the host's `sessionController.rename`, which pins the title source to
+`user` so it is no longer overwritten by automatic title generation — exactly what we want.
 
 ---
 
@@ -181,7 +211,8 @@ therefore read only at runtime).
 | `maxPromptChars` | `20000` | Prompt size ceiling (characters) |
 | `maxAnswerChars` | `12000` | Answer size ceiling returned to the asking session |
 | `stateFile` | `''` | State file path; empty means `$DSH_HOME/second-opinion/state.json` |
-| `advisorLabel` | `second-opinion-advisor` | Advisor label (naming only) |
+| `advisorLabel` | `辅助` | Prefix for advisor session titles, followed by the asking session's first three characters |
+| `maxAdvisors` | `9` | Maximum number of advisor slots per asking session |
 
 Over-long content is truncated **with a visible marker**
 (`…(content too long, truncated, original N characters)`). Silent truncation would let a
@@ -208,6 +239,8 @@ model conclude from incomplete information believing it was complete.
 | `agent.whenIdle()` / `agent.status` | ✅ | Waits for the advisor to finish |
 | `agent.session.seq` / `snapshotEvents(from)` | ✅ | Defines the answer boundary and reads the reply |
 | `ctx.agents.get(id)` | ⭕ optional | `advisor_status` uses it for `live`; consults work without it |
+| `ctx.sessionTitle.get(session)` | ⭕ optional | Reads the asking session's title as the naming source; falls back to the session id |
+| `sessionController.rename()` | ⭕ optional | Titles advisor sessions. Skipped on an older host that lacks it; consults still work |
 | `@deepseek-ai/dsh-llm`'s `createUserMessage` | ⭕ optional | **Deliberately unused**: the package is not in the profile's `node_modules`. This plugin builds messages itself (see below) |
 
 **Zero runtime dependencies**: only `node:fs` / `node:os` / `node:path` / `node:crypto`
@@ -241,10 +274,13 @@ permanently unopenable**.
 $DSH_HOME/second-opinion/state.json     # default; falls back to ~/.dsh when DSH_HOME is unset
 ```
 
-Only three fields matter: `advisorSessionId` (the reused advisor), `consults` (total
-count), `createdAt`. A corrupt file falls back to an empty table — the worst case is
-simply a freshly created advisor. Deleting it means the next consult creates a new advisor
-(the old session itself remains).
+State lives under `advisors`, keyed by the **asking session's id**; each entry holds
+`createdAt`, the last known asking title, and a `slots[]` array of advisor records
+(`sessionId`, `title`, `cwd`, `createdAt`, `consults`, `lastConsultAt`). Plus a `version`
+and, when upgrading from the old flat layout, a `legacyAdvisorSessionId` note. A corrupt
+file falls back to an empty table — the worst case is simply freshly created advisors.
+Deleting it means the next consult creates new advisors (the old sessions themselves
+remain).
 
 ---
 
@@ -271,7 +307,8 @@ Minimal flow (you do not have to be genuinely stuck):
 
 1. Have the model call `ask_advisor` with something it can check, e.g.
    `question: "What is 2 to the power of 10?"`;
-2. Look at the returned `advisor.sessionId` — that session is visible in the GUI session list;
+2. Look at the returned `advisor.sessionId` and `advisor.title` — that session is visible
+   in the GUI session list, titled "辅助" + the first three characters of your own title;
 3. Open the advisor session; you should see a self-introduction (`ADVISOR_INTRO`) and your question;
 4. Back in the asking session, `answer` holds the advisor's reply text.
 
@@ -281,13 +318,15 @@ Self-tests (pure functions + a host mock, **no real DSH needed**):
 npm test        # = node test/selftest.mjs && node test/host-mock.mjs
 ```
 
-- `test/selftest.mjs` (44 assertions): `compose.js` pure functions — prompt assembly,
-  answer extraction (including the streaming fallback and "empty message must not swallow
-  the body"), truncation markers.
-- `test/host-mock.mjs` (51 assertions): calls `apply()` for real against a fake ctx,
-  covering tool registration, a normal answer, timeout, empty answer, **recursion guard**,
-  advisor revive failure, creation failure, **concurrent serialization**, and corrupt-state
-  recovery.
+- `test/selftest.mjs` (67 assertions): `compose.js` pure functions — prompt assembly,
+  answer extraction (stream fallback, "empty messages must not swallow text"), truncation
+  markers, and **advisor title naming** (first three characters, slot numbers, emoji not
+  split in half, empty-title fallback).
+- `test/host-mock.mjs` (94 assertions): calls `apply()` for real against a fake ctx,
+  covering tool registration, normal answers, timeouts, empty answers, **recursion guard**,
+  advisor revive failure, creation failure, **concurrent serialization**, **per-session
+  advisors not interfering**, **titles only rewritten when they actually change**,
+  corrupt-state recovery, and legacy flat-state migration.
 
 It cannot replace a real session run (a fake agent does not actually think), but it pins
 down the **contract**: who throws, who returns an error object, and which event range the

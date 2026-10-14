@@ -10,7 +10,7 @@
  * 运行：node test/selftest.mjs
  */
 
-import { ADVISOR_INTRO, buildConsultPrompt, extractAnswer, clamp } from '../lib/compose.js';
+import { ADVISOR_INTRO, advisorTitle, buildConsultPrompt, extractAnswer, clamp, leadingChars } from '../lib/compose.js';
 
 let pass = 0;
 const failures = [];
@@ -170,6 +170,34 @@ ok(ADVISOR_INTRO.includes('看不到'), '自我介绍说明顾问看不到对话
 ok(!ADVISOR_INTRO.includes('你的 cwd'), '自我介绍不硬断言两边目录相同');
 ok(ADVISOR_INTRO.includes('目录'), '自我介绍说明按求助方给的目录理解相对路径');
 ok(ADVISOR_INTRO.length > 100, '自我介绍有实质内容');
+
+// ── leadingChars：取「字」不能按 UTF-16 码元切 ──────────────────────────
+eq(leadingChars('正则匹配不上', 3), '正则匹', '取前三字');
+eq(leadingChars('ab', 3), 'ab', '不足三字时全取');
+eq(leadingChars('  前后有空格  ', 2), '前后', '先归一化空白再取');
+eq(leadingChars('a b c', 3), 'a b', '内部空白折叠成一个空格后参与计数');
+eq(leadingChars('', 3), '', '空串返回空');
+eq(leadingChars(null, 3), '', 'null 安全');
+eq(leadingChars(undefined, 3), '', 'undefined 安全');
+eq(leadingChars(123, 2), '12', '非字符串转成字符串再取');
+// 这一条是选 Array.from 而不是 slice 的理由：slice 会把代理对切成半个字符
+eq(leadingChars('👍👍👍', 2), '👍👍', 'emoji 按整字符切（slice 会切成乱码）');
+eq(Array.from(leadingChars('👍👍👍', 2)).length, 2, '切出来正好两个码点');
+eq(leadingChars('abc', 0), 'abc', 'n<=0 视为没给值，退回默认 3 个字');
+eq(leadingChars('abc', NaN), 'abc', 'n 是 NaN 时退回默认 3 个字');
+
+// ── advisorTitle：顾问会话命名规则 ───────────────────────────────────────
+eq(advisorTitle('正则匹配不上', 1), '辅助正则匹', '第一个顾问：辅助 + 前三字，不带数字');
+eq(advisorTitle('正则匹配不上', 2), '辅助正则匹2', '第二个顾问加数字 2');
+eq(advisorTitle('正则匹配不上', 3), '辅助正则匹3', '第三个顾问加数字 3');
+eq(advisorTitle('xy', 1), '辅助xy', '不足三字时全用');
+eq(advisorTitle('', 1), '辅助未命名', '取不到标题时回退「未命名」');
+eq(advisorTitle(null, 1), '辅助未命名', 'null 标题回退');
+eq(advisorTitle('标题', 1, '顾问'), '顾问标题', '前缀可配置');
+eq(advisorTitle('标题', 1, ''), '标题', '空前缀时只剩标题，不炸');
+eq(advisorTitle('标题', 0), '辅助标题', '槽位 0 当作 1（不加数字）');
+eq(advisorTitle('标题', -5), '辅助标题', '负数槽位当作 1');
+eq(advisorTitle('  空格  开头', 1), '辅助空格', '标题先归一化空白，且不留尾随空格');
 
 // ── 结果 ────────────────────────────────────────────────────────────────
 const total = pass + failures.length;

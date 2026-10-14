@@ -143,12 +143,13 @@ function toolSchemaViolations(tool) {
  * `inject` 要同步回调（真实 Cordis 是 effect 里的），这里直接调用以便 apply
  * 返回后就能拿到注册结果。
  */
-function makeCtx({ controller } = {}) {
+function makeCtx({ controller, titles } = {}) {
   const tools = new Map();
   const ctx = {
     logger: undefined,
     get(name) {
       if (name === 'sessionController') return controller;
+      if (name === 'sessionTitle') return titles;
       if (name === 'agents') return { get: () => undefined };
       return undefined;
     },
@@ -215,7 +216,7 @@ function makeAgent({ id = 'session-advisor', cwd = 'D:\\work', answer = '顾问�
 
 /** 造一个假 sessionController。 */
 function makeController({ existing, createResult, resolveErrors = {} } = {}) {
-  const state = { existing, created: [], resolveCalls: [] };
+  const state = { existing, created: [], resolveCalls: [], renames: [] };
   return {
     state,
     async resolveAgent(sessionId) {
@@ -231,23 +232,50 @@ function makeController({ existing, createResult, resolveErrors = {} } = {}) {
       if (createResult === undefined) return { sessionId: 'session-new' };
       return createResult;
     },
+    async rename(request) {
+      state.renames.push(request);
+      return { title: request.title, seq: 1 };
+    },
   };
 }
 
 /**
- * 起一个被测插件实例。
+ * 造一个假 sessionTitle 服务。
  *
- * 注意 `seed` 的必要性：顾问会话 id 是**记在状态文件里**的，插件只认自己
- * 记录过的那个顾问。所以想测「复用已有顾问」，必须先把这个 id 写进状态，
- * 光给一个活着的 agent 是不够的。
+ * 顾问的标题取自**求助会话**的标题，所以要能按会话给出不同标题。
  */
-async function setup({ controller, name, seed, config = {} } = {}) {
+function makeTitleService(titles = {}) {
+  return {
+    get(session) {
+      const title = titles[session?.id];
+      return title === undefined ? undefined : { title };
+    },
+  };
+}
+
+/**
+ * 造一份「某个求助会话已经有第 slot 个顾问」的状态。
+ *
+ * 顾问会话 id 是**记在状态文件里**的，插件只认自己记录过的那个顾问。所以想
+ * 测「复用已有顾问」，必须先把这个 id 写进状态，光给一个活着的 agent 是不够的。
+ *
+ * @param {string} callerId 求助方会话 id。
+ * @param {string} advisorId 顾问会话 id。
+ * @param {number} slot 槽位（从 1 开始）。
+ */
+function seedAdvisor(callerId, advisorId, slot = 1) {
+  const slots = [];
+  slots[slot - 1] = { sessionId: advisorId, title: null, cwd: null, createdAt: 1, consults: 0, lastConsultAt: 0 };
+  return { version: 2, advisors: { [callerId]: { createdAt: 1, title: '', slots } } };
+}
+
+async function setup({ controller, titles, name, seed, config = {} } = {}) {
   const file = join(sandbox, `${name}.json`);
   if (seed) {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(file, JSON.stringify(seed), 'utf8');
   }
-  const { ctx, tools } = makeCtx({ controller });
+  const { ctx, tools } = makeCtx({ controller, titles });
   apply(ctx, { stateFile: file, ...config });
   return { ctx, tools, file };
 }
@@ -278,7 +306,7 @@ function teach(controller, agent) {
   }
 
   eq(tool.parameters.type, 'object', 'ask_advisor 的 parameters 是完整 JSON Schema');
-  eq(Object.keys(tool.parameters.properties), ['question', 'situation', 'tried', 'context'], 'ask_advisor 参数表');
+  eq(Object.keys(tool.parameters.properties), ['question', 'situation', 'tried', 'context', 'advisor'], 'ask_advisor 参数表');
   eq(tool.parameters.required, ['question'], 'question 是唯一必填项');
   eq(tool.parameters.properties.question.type, 'string', 'question 是字符串');
   eq(tool.parameters.properties.situation.required, undefined, '选填项不写逐属性 required');
@@ -337,8 +365,9 @@ function teach(controller, agent) {
   const controller = makeController({ existing: advisor });
   const { tools } = await setup({
     controller,
+    titles: makeTitleService({ 'session-caller': '正则匹配不上' }),
     name: 'a',
-    seed: { advisorSessionId: 'session-keep' },
+    seed: seedAdvisor('session-caller', 'session-keep'),
   });
 
   const result = await tools.get('ask_advisor').execute(
@@ -371,7 +400,7 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller,
     name: 'b',
-    seed: { advisorSessionId: 'session-other' },
+    seed: seedAdvisor('session-caller', 'session-other'),
   });
 
   await tools.get('ask_advisor').execute(
@@ -418,7 +447,7 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller,
     name: 'd',
-    seed: { advisorSessionId: 'session-dead' },
+    seed: seedAdvisor('session-caller', 'session-dead'),
   });
 
   const result = await tools.get('ask_advisor').execute(
@@ -439,7 +468,7 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller,
     name: 'e',
-    seed: { advisorSessionId: 'session-advisor-self' },
+    seed: seedAdvisor('session-owner', 'session-advisor-self'),
   });
 
   const result = await tools.get('ask_advisor').execute(
@@ -458,7 +487,7 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller: makeController({ existing: advisor }),
     name: 'f',
-    seed: { advisorSessionId: 'session-p' },
+    seed: seedAdvisor('session-caller', 'session-p'),
   });
   const tool = tools.get('ask_advisor');
 
@@ -478,7 +507,7 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller: makeController({ existing: advisor }),
     name: 'g',
-    seed: { advisorSessionId: 'session-hang' },
+    seed: seedAdvisor('session-caller', 'session-hang'),
     config: { waitMs: 1500 },
   });
 
@@ -502,7 +531,7 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller: makeController({ existing: advisor }),
     name: 'h',
-    seed: { advisorSessionId: 'session-silent' },
+    seed: seedAdvisor('session-caller', 'session-silent'),
   });
 
   const result = await tools.get('ask_advisor').execute(
@@ -556,13 +585,13 @@ function teach(controller, agent) {
   const { tools } = await setup({
     controller: makeController({ existing: advisor }),
     name: 'i',
-    seed: { advisorSessionId: 'session-serial' },
+    seed: seedAdvisor('session-1', 'session-serial'),
   });
   const tool = tools.get('ask_advisor');
 
   const [a, b] = await Promise.all([
     tool.execute({ question: '第一个问题' }, { agent: { session: { id: 'session-1' } } }),
-    tool.execute({ question: '第二个问题' }, { agent: { session: { id: 'session-2' } } }),
+    tool.execute({ question: '第二个问题' }, { agent: { session: { id: 'session-1' } } }),
   ]);
 
   eq(a.answer, '回答1', '第一个咨询拿到第一次回答');
@@ -575,27 +604,28 @@ function teach(controller, agent) {
   const advisor = makeAgent({ id: 'session-status' });
   const { tools, file } = await setup({
     controller: makeController({ existing: advisor }),
+    titles: makeTitleService({ 'session-caller': '会话时钟测试' }),
     name: 'j',
-    seed: { advisorSessionId: 'session-status' },
+    seed: seedAdvisor('session-caller', 'session-status'),
   });
   const status = tools.get('advisor_status');
+  const caller = { agent: { session: { id: 'session-caller' } } };
 
-  const before = await status.execute({});
-  eq(before.advisorSessionId, 'session-status', '读出已记录的顾问 id');
-  eq(before.consults, 0, '尚未咨询时计数为 0');
+  const before = await status.execute({}, caller);
+  eq(before.advisors.length, 1, '读出本会话的顾问');
+  eq(before.advisors[0].sessionId, 'session-status', '顾问会话 id 正确');
+  eq(before.advisors[0].consults, 0, '尚未咨询时计数为 0');
+  eq(before.callerTitle, '会话时钟测试', '读出求助会话标题');
   ok(typeof before.stateFile === 'string' && before.stateFile.includes('j.json'), '报告状态文件位置');
 
-  await tools.get('ask_advisor').execute(
-    { question: 'Q' },
-    { agent: { session: { id: 'session-caller' } } },
-  );
+  await tools.get('ask_advisor').execute({ question: 'Q' }, caller);
 
-  const after = await status.execute({});
-  eq(after.consults, 1, '咨询计数递增');
+  const after = await status.execute({}, caller);
+  eq(after.advisors[0].consults, 1, '咨询计数递增');
 
-  const reset = await status.execute({ reset: true });
-  eq(reset.advisorSessionId, null, 'reset 后清空顾问记录');
-  eq(reset.previousAdvisorSessionId, 'session-status', 'reset 报告被丢弃的顾问 id');
+  const reset = await status.execute({ reset: true }, caller);
+  eq(reset.advisors.length, 0, 'reset 后清空本会话的顾问记录');
+  eq(reset.droppedAdvisorSessionIds, ['session-status'], 'reset 报告被丢弃的顾问 id');
   ok(file.length > 0, '状态文件路径可用');
 }
 
@@ -611,7 +641,150 @@ function teach(controller, agent) {
   ok(tools.has('ask_advisor'), '状态文件损坏时插件照常注册');
 
   const status = await tools.get('advisor_status').execute({});
-  eq(status.advisorSessionId, null, '损坏状态按空处理');
+  eq(status.advisors, [], '损坏状态按空处理');
+  eq(status.legacyAdvisorSessionId, null, '损坏状态没有遗留顾问');
+}
+
+// ── 13. 顾问按求助会话分开，互不影响 ─────────────────────────────────────
+
+{
+  const controller = makeController({});
+  const a = makeAgent({ id: 'session-advisor-a', answer: 'A 的答案' });
+  const b = makeAgent({ id: 'session-advisor-b', answer: 'B 的答案' });
+  controller.resolveAgent = async (id) => {
+    if (id === 'session-advisor-a') return { agent: a };
+    if (id === 'session-advisor-b') return { agent: b };
+    return { error: { code: 'session/not-found', message: 'no such session' } };
+  };
+  controller.create = async (request) => {
+    controller.state.created.push(request);
+    return { sessionId: `session-made-${controller.state.created.length}` };
+  };
+  const madeA = makeAgent({ id: 'session-made-1', answer: 'A 的答案' });
+  const madeB = makeAgent({ id: 'session-made-2', answer: 'B 的答案' });
+  const originResolve = controller.resolveAgent;
+  controller.resolveAgent = async (id) => {
+    if (id === 'session-made-1') return { agent: madeA };
+    if (id === 'session-made-2') return { agent: madeB };
+    return originResolve(id);
+  };
+
+  const { tools } = await setup({
+    controller,
+    titles: makeTitleService({ 'session-alpha': '阿尔法任务', 'session-beta': '贝塔任务' }),
+    name: 'm',
+  });
+  const tool = tools.get('ask_advisor');
+
+  const ra = await tool.execute({ question: 'Q-A' }, { agent: { session: { id: 'session-alpha' } } });
+  const rb = await tool.execute({ question: 'Q-B' }, { agent: { session: { id: 'session-beta' } } });
+
+  eq(ra.ok, true, '会话 A 咨询成功');
+  eq(rb.ok, true, '会话 B 咨询成功');
+  eq(controller.state.created.length, 2, '两个不同会话各建了一个顾问');
+  ok(ra.advisor.sessionId !== rb.advisor.sessionId, '两个会话的顾问是不同会话');
+  eq(ra.answer, 'A 的答案', '会话 A 拿到自己的答案');
+  eq(rb.answer, 'B 的答案', '会话 B 拿到自己的答案');
+
+  // 名称来自各自求助会话的标题前三字
+  const titles = controller.state.renames.map((r) => r.title);
+  ok(titles.includes('辅助阿尔法'), `会话 A 的顾问按标题命名（实际 ${JSON.stringify(titles)}）`);
+  ok(titles.includes('辅助贝塔任'), '会话 B 的顾问按标题命名（「贝塔任务」取前三字是「贝塔任」）');
+}
+
+// ── 14. 同一会话要第二个顾问：另建独立会话 ───────────────────────────────
+
+{
+  const controller = makeController({ createResult: { sessionId: 'session-second' } });
+  const first = makeAgent({ id: 'session-first', answer: '第一个顾问的答案' });
+  const second = makeAgent({ id: 'session-second', answer: '第二个顾问的答案' });
+  controller.resolveAgent = async (id) => {
+    if (id === 'session-first') return { agent: first };
+    if (id === 'session-second') return { agent: second };
+    return { error: { code: 'session/not-found', message: 'no such session' } };
+  };
+
+  const { tools } = await setup({
+    controller,
+    titles: makeTitleService({ 'session-caller': '来回打转的会话' }),
+    name: 'n',
+    seed: seedAdvisor('session-caller', 'session-first'),
+  });
+  const tool = tools.get('ask_advisor');
+
+  const one = await tool.execute({ question: 'Q1' }, { agent: { session: { id: 'session-caller' } } });
+  eq(one.advisor.slot, 1, '默认用第 1 个顾问');
+  eq(one.advisor.sessionId, 'session-first', '第 1 个顾问是已有的那个');
+  eq(controller.state.created.length, 0, '第 1 个顾问存在时不新建');
+
+  const two = await tool.execute(
+    { question: 'Q2', advisor: 2 },
+    { agent: { session: { id: 'session-caller' } } },
+  );
+  eq(controller.state.created.length, 1, '要第 2 个顾问时新建了一个会话');
+  eq(two.advisor.slot, 2, '返回的槽位是 2');
+  eq(two.advisor.sessionId, 'session-second', '第 2 个顾问是新会话');
+  eq(two.answer, '第二个顾问的答案', '第 2 个顾问的答案正确');
+  eq(first.sent.length, 1, '第 1 个顾问只收到自己那一条');
+
+  const names = controller.state.renames.map((r) => r.title);
+  ok(names.includes('辅助来回打'), `第 1 个顾问按标题命名（实际 ${JSON.stringify(names)}）`);
+  ok(names.includes('辅助来回打2'), '第 2 个顾问带槽位号 2');
+}
+
+// ── 15. 取不到求助会话标题时回退 ─────────────────────────────────────────
+
+{
+  const controller = makeController({ createResult: { sessionId: 'session-named' } });
+  const made = makeAgent({ id: 'session-named', answer: 'ok' });
+  controller.resolveAgent = async (id) =>
+    id === 'session-named' ? { agent: made } : { error: { code: 'session/not-found', message: 'no' } };
+
+  // 故意不给 titles：模拟宿主没挂 sessionTitle 服务
+  const { tools } = await setup({ controller, name: 'o' });
+  await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-0f3a91c2-77bd' } } },
+  );
+
+  const shown = controller.state.renames.map((r) => r.title);
+  ok(shown.length === 1, '仍然尝试命名');
+  ok(shown[0].startsWith('辅助'), '回退命名仍带前缀');
+  ok(shown[0].includes('0f3'), `拿不到标题时回退成会话 id 前几字（实际 ${JSON.stringify(shown)}）`);
+}
+
+// ── 16. 旧版扁平状态能平滑升级 ───────────────────────────────────────────
+
+{
+  const controller = makeController({ createResult: { sessionId: 'session-migrated' } });
+  const made = makeAgent({ id: 'session-migrated', answer: 'ok' });
+  controller.resolveAgent = async (id) =>
+    id === 'session-migrated' ? { agent: made } : { error: { code: 'session/not-found', message: 'no' } };
+
+  const { tools, file } = await setup({
+    controller,
+    name: 'p',
+    seed: { advisorSessionId: 'session-old-flat', consults: 7, createdAt: 1, lastConsultAt: 2 },
+  });
+
+  const status = await tools.get('advisor_status').execute({});
+  eq(status.legacyAdvisorSessionId, 'session-old-flat', '旧顾问 id 被留痕');
+  eq(status.advisors, [], '旧记录不硬塞给任何会话（归属未知）');
+
+  const result = await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-new-caller' } } },
+  );
+  eq(result.ok, true, '迁移后照常咨询');
+  eq(result.advisor.sessionId, 'session-migrated', '为这次求助新建了顾问');
+
+  // 旧版的全局计数字段要清掉：留着会让人误以为顾问是全局共享的。
+  const { readFileSync } = await import('node:fs');
+  const upgraded = JSON.parse(readFileSync(file, 'utf8'));
+  eq('advisorSessionId' in upgraded, false, '旧 advisorSessionId 已删除');
+  eq('consults' in upgraded, false, '旧全局 consults 已删除');
+  eq('lastConsultAt' in upgraded, false, '旧全局 lastConsultAt 已删除');
+  eq(upgraded.version, 2, '状态版本升到 2');
 }
 
 // ── 结果 ──────────────────────────────────────────────────────────────────

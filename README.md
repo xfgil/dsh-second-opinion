@@ -29,8 +29,10 @@
 本插件提供这个视角，成本是一次工具调用：
 
 ```
-A 卡住 → 调 ask_advisor → 插件创建/复用顾问会话 B → B 独立分析 → 答案回到 A
+A 卡住 → 调 ask_advisor → 插件为 A 建一个专属顾问会话（名为「辅助+前三字」）→ B 独立分析 → 答案回到 A
 ```
+
+每个求助会话有**自己的**顾问（没求助过的会话不会被建），同一个问题想让第二个独立会话再想一遍时，传 `advisor: 2` 再要一个。
 
 ---
 
@@ -69,7 +71,8 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
                                                   ▼
                                           ┌─────────────────┐
                                           │  顾问会话 B      │
-                                          │ （自动创建、复用） │
+                                          │ （自动创建，每     │
+                                          │  个求助方一个）    │
                                           └─────────────────┘
 ```
 
@@ -82,8 +85,9 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
    `@deepseek-ai/dsh-subagent` 的 `finalAssistantOutput` 保持一致：取
    **最后一条非空** assistant 消息，空 content 的消息（记账用）不能覆盖已有正文。
    这样顾问「先给正文、再补一次只有工具调用的空消息」时，正文不会被吞掉。
-3. **同一顾问串行排队。** 两个会话同时咨询同一个顾问时，后者的答案边界会和
-   前者重叠，读到别人的回答。per-advisor 的 Promise 链把并发请求排成队列。
+3. **同一个顾问槽位串行排队。** 每个求助会话有自己的顾问，但同一个槽位可能被
+   并发咨询（同一会话的两处工具调用、或它派生的子代理），此时后者的答案边界会和
+   前者重叠、读到别人的回答。per-advisor 的 Promise 链把并发请求排成队列。
 4. **等待以 `agent.status` 为准，不靠 `whenIdle()` 单打独斗。** 宿主
    `wakeDriver` 在 agent 已经不是 idle 时会**直接 return、不新建 `activityDone`**
    （`dsh-agent-loop` 的 `wakeDriver()` 开头 `if (this.phase.kind !== "idle") { ... return; }`）。
@@ -125,13 +129,14 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 | `situation` | ⭕ | 你卡在哪：正在做什么、期望什么、实际发生什么 |
 | `tried` | ⭕ | 已试过哪些做法、各自为什么不行。**这段最有价值**——它让顾问不必重复你的死路 |
 | `context` | ⭕ | 相关上下文原文：文件路径、代码片段、报错信息 |
+| `advisor` | ⭕ | 用第几个顾问，默认 `1`。想让同一个问题由**另一个完全独立**的会话再想一遍时传 `2`、`3`……每个槽位是独立顾问会话，互不知道对方的存在 |
 
 返回：
 
 ```json
 {
   "ok": true,
-  "advisor": { "sessionId": "session-...", "cwd": "D:\\...\\你的工作目录" },
+  "advisor": { "sessionId": "session-...", "title": "辅助正则匹", "slot": 1, "cwd": "D:\\...\\你的工作目录" },
   "elapsedMs": 48213,
   "timedOut": false,
   "answer": "……顾问的完整回答……"
@@ -143,14 +148,37 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 
 ### `advisor_status`
 
-查顾问会话状态，或在它行为异常时重置它。
+查**本会话**的顾问状态，或重置它。
 
 | 参数 | 必需 | 说明 |
 | --- | --- | --- |
-| `reset` | ⭕ | 设为 `true` 则丢弃当前顾问记录，下次咨询会**新建**一个（不删除旧会话本身） |
+| `reset` | ⭕ | 设为 `true` 则丢弃**本会话**的顾问记录，下次咨询会**新建**一个（不删除旧会话本身） |
+| `all` | ⭕ | 设为 `true` 则额外列出所有求助会话各自的顾问 |
 
-返回 `advisorSessionId` / `cwd` / `live` / `consults` / `lastConsultAt` /
-`createdAt` / `stateFile`。
+返回 `callerSessionId` / `callerTitle` / `advisors`（数组，每项含 `slot` /
+`sessionId` / `title` / `cwd` / `live` / `consults` / `lastConsultAt` /
+`createdAt`）/ `droppedAdvisorSessionIds` / `legacyAdvisorSessionId` /
+`maxAdvisors` / `stateFile`。
+
+### 顾问会话怎么命名
+
+顾问会话的标题由插件写入，规则是 **`辅助` + 求助会话标题的前三字**（前缀可用
+`advisorLabel` 改）；同一个求助会话的第 2、3 个顾问在后面加槽位号：
+
+| 求助会话标题 | 槽位 | 顾问标题 |
+| --- | --- | --- |
+| 正则匹配不上 | 1 | 辅助正则匹 |
+| 正则匹配不上 | 2 | 辅助正则匹2 |
+| 真 | 1 | 辅助真 |
+
+这样在会话列表里一眼就能看出每个顾问在为谁服务。
+
+两个细节：求助会话还没起标题时（新会话首轮之前）退回**会话 id 的前几位**，
+不至于空着；求助会话的标题之后变了，下次咨询会**顺带把顾问名一起更新**
+（只在确实不同时才写，不会每次咨询都往日志里塞一条事件）。
+
+命名走宿主的 `sessionController.rename`——它会把标题来源钉成 `user`，
+之后不会再被自动标题生成覆盖，正是我们要的效果。
 
 ---
 
@@ -168,7 +196,8 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 | `maxPromptChars` | `20000` | 发给顾问的提示词上限（字符） |
 | `maxAnswerChars` | `12000` | 返回给求助方的答案上限（字符） |
 | `stateFile` | `''` | 状态文件路径；空则用 `$DSH_HOME/second-opinion/state.json` |
-| `advisorLabel` | `second-opinion-advisor` | 顾问会话的标签（仅用于命名） |
+| `advisorLabel` | `辅助` | 顾问会话标题的前缀，后面接求助会话标题前三字 |
+| `maxAdvisors` | `9` | 一个求助会话最多有几个顾问槽位 |
 
 超长内容会**带标记截断**（`…（内容过长，已截断，原长 N 字符）`）——静默截断会让
 模型以为内容本来就这么短，基于不完整信息下结论。
@@ -194,6 +223,8 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 | `agent.whenIdle()` / `agent.status` | ✅ | 等顾问答完 |
 | `agent.session.seq` / `snapshotEvents(from)` | ✅ | 划定答案边界、取回答 |
 | `ctx.agents.get(id)` | ⭕ 可选 | `advisor_status` 用它报 `live`；没有也不影响咨询 |
+| `ctx.sessionTitle.get(session)` | ⭕ 可选 | 读求助会话标题，作为顾问命名的来源；取不到就退回会话 id |
+| `sessionController.rename()` | ⭕ 可选 | 给顾问会话改名。宿主太旧没有它时直接跳过，咨询照常 |
 | `@deepseek-ai/dsh-llm` 的 `createUserMessage` | ⭕ 可选 | **刻意不用**：该包不在 profile 的 `node_modules` 里。本插件自己构造消息（见下） |
 
 **零运行时依赖**：只用 `node:fs` / `node:os` / `node:path` / `node:crypto`，
@@ -225,9 +256,13 @@ SessionQueryError: stored session "..." is corrupt:
 $DSH_HOME/second-opinion/state.json     # 默认；DSH_HOME 缺省时退回 ~/.dsh
 ```
 
-只有三个字段有意义：`advisorSessionId`（复用的顾问会话）、`consults`（累计次数）、
-`createdAt`。文件损坏时按空表继续，最坏情况只是重新建一个顾问。
-删掉它 = 下次咨询新建顾问（旧会话本身还在）。
+状态按**求助会话的 id** 归档在 `advisors` 下；每份档案记 `createdAt`、最近一次读到的
+求助方标题、以及 `slots[]` 槽位数组（每项含 `sessionId` / `title` / `cwd` /
+`createdAt` / `consults` / `lastConsultAt`）。另有 `version`，以及从旧版扁平结构升级时
+留下的 `legacyAdvisorSessionId` 痕迹。
+
+文件损坏时按空表继续，最坏情况只是重新建顾问。删掉它 = 下次咨询新建顾问
+（旧会话本身还在）。
 
 ---
 
@@ -254,7 +289,8 @@ dsh plugin --profile <你的profile> add dsh-second-opinion
 
 1. 让模型调 `ask_advisor`，随便问一个它能验证的问题，例如
    `question: "2 的 10 次方是多少？"`；
-2. 看返回的 `advisor.sessionId`——在 GUI 的会话列表里能找到那个会话；
+2. 看返回的 `advisor.sessionId` 与 `advisor.title`——在 GUI 的会话列表里能找到
+   那个会话，标题形如「辅助<你标题的前三字>」；
 3. 打开顾问会话，应该能看到一条自我介绍（`ADVISOR_INTRO`）和你的提问原文；
 4. 回到求助方，`answer` 字段就是顾问的回复正文。
 
@@ -264,11 +300,13 @@ dsh plugin --profile <你的profile> add dsh-second-opinion
 npm test        # = node test/selftest.mjs && node test/host-mock.mjs
 ```
 
-- `test/selftest.mjs`（44 项）：`compose.js` 的纯函数——提示词组装、
-  答案提取（含流式兜底与「空消息不吞正文」）、截断标记。
-- `test/host-mock.mjs`（51 项）：用假 ctx 真实调用 `apply()`，
+- `test/selftest.mjs`（67 项）：`compose.js` 的纯函数——提示词组装、
+  答案提取（含流式兜底与「空消息不吞正文」）、截断标记、**顾问标题命名**
+  （前三字、多槽位加号、emoji 不劈半、空标题回退）。
+- `test/host-mock.mjs`（94 项）：用假 ctx 真实调用 `apply()`，
   覆盖工具注册、正常回答、超时、空回答、**递归保护**、顾问恢复失败、
-  创建失败、**并发串行排队**、状态文件损坏恢复。
+  创建失败、**并发串行排队**、**分会话顾问互不干扰**、**标题改名只在需要时发**、
+  状态文件损坏恢复、旧版扁平状态迁移。
 
 它当然不能替代真实会话跑通（假的 agent 不会真的思考），但能钉住**契约**：
 谁抛错、谁返回错误对象、答案从哪段事件区间取。
