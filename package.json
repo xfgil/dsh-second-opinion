@@ -1,0 +1,52 @@
+{
+  "name": "dsh-second-opinion",
+  "version": "0.1.0",
+  "description": "跨会话「第二意见」：一个会话卡住时，把问题交给另一个独立会话单独思考，把方案拿回来。求助方在自己的工具调用里同步等顾问答完，答案作为工具结果直接返回——不需要唤醒闲置会话，也不冒充用户发言。A second opinion from an independent session when you are stuck.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "harness",
+    "plugin",
+    "cross-session",
+    "second-opinion",
+    "advisor",
+    "consult",
+    "stuck"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "xfgil",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xfgil/dsh-second-opinion.git"
+  },
+  "homepage": "https://github.com/xfgil/dsh-second-opinion#readme",
+  "bugs": {
+    "url": "https://github.com/xfgil/dsh-second-opinion/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs && node test/host-mock.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

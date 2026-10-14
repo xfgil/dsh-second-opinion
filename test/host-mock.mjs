@@ -1,0 +1,628 @@
+/**
+ * dsh-second-opinion / test/host-mock.mjs
+ *
+ * selftest.mjs 只测 compose.js 的纯函数，index.js 一行都没测到——那是最大的
+ * 盲区：工具注册、错误路径、顾问复用/重建、串行排队、答案边界、超时，全在那边。
+ *
+ * 这里用一个假的 ctx 把宿主顶掉，真实调用 `apply()`，把两条路走一遍：
+ *   1. 注册出的工具形状正确、能拿到；
+ *   2. 工具的 execute 在各条路径下的行为（正常回答、超时、空回答、递归、
+ *      顾问恢复失败、创建失败、并发排队）。
+ *
+ * 它当然不能替代真实会话跑通（假的 agent 不会真的思考），但能钉住**契约**：
+ * 谁抛错、谁返回错误对象、答案从哪段事件区间取。
+ *
+ * 运行：node test/host-mock.mjs
+ */
+
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// 必须在 import 插件之前设好，否则状态文件会落到真实的 ~/.dsh 里。
+const sandbox = mkdtempSync(join(tmpdir(), 'dsh-second-opinion-test-'));
+process.env.DSH_HOME = sandbox;
+
+const { apply } = await import('../lib/index.js');
+
+let pass = 0;
+const failures = [];
+
+function ok(condition, label) {
+  if (condition) {
+    pass += 1;
+    return;
+  }
+  failures.push(label);
+}
+
+function eq(actual, expected, label) {
+  const a = JSON.stringify(actual);
+  const b = JSON.stringify(expected);
+  if (a === b) {
+    pass += 1;
+    return;
+  }
+  failures.push(`${label}\n    实际: ${a}\n    期望: ${b}`);
+}
+
+// ── schema 校验器（照抄宿主的 enforced 子集）───────────────────────────────
+
+const SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']);
+const CONSTRAINT_KEYS = new Set([
+  'type',
+  'oneOf',
+  'properties',
+  'required',
+  'additionalProperties',
+  'items',
+  'enum',
+  'const',
+]);
+const ANNOTATION_KEYS = new Set(['description', 'title', 'default', 'examples']);
+
+/**
+ * 校验一个 schema 节点是否落在宿主 `@deepseek-ai/dsh-tools` 的 enforced 子集里。
+ *
+ * 为什么测试里要复刻一遍：`tools.register()` **根本不校验 `parameters`**，只看
+ * `output.schema`。所以 parameters 写错了注册照样成功，一路漏到真实请求才以
+ * `invalid_function_parameters` / code 11129 炸掉——本地是唯一能在提交前拦住
+ * 它的地方。2026-10-14 就是漏了这一步，把 `ask_advisor` 的扁平参数映射发了出去。
+ *
+ * @param {unknown} schema 待校验节点。
+ * @param {string} path 诊断路径。
+ * @param {string[]} out 违规描述收集器。
+ */
+function checkSchema(schema, path, out) {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) {
+    out.push(`${path} 必须是对象`);
+    return;
+  }
+  for (const key of Object.keys(schema)) {
+    if (!CONSTRAINT_KEYS.has(key) && !ANNOTATION_KEYS.has(key)) out.push(`${path}.${key} 不是受支持的关键字`);
+  }
+  const type = schema.type;
+  if (typeof type !== 'string' || !SCHEMA_TYPES.has(type)) {
+    out.push(`${path}.type 必须是 ${[...SCHEMA_TYPES].join('/')} 之一（当前 ${JSON.stringify(type)}）`);
+    return;
+  }
+  if (type !== 'object') {
+    for (const key of ['properties', 'required', 'additionalProperties']) {
+      if (Object.hasOwn(schema, key)) out.push(`${path}.${key} 只能出现在 object 节点上`);
+    }
+  }
+  if (type !== 'array' && Object.hasOwn(schema, 'items')) out.push(`${path}.items 只能出现在 array 节点上`);
+  if (type === 'object') {
+    if (Object.hasOwn(schema, 'additionalProperties') && typeof schema.additionalProperties !== 'boolean') {
+      out.push(`${path}.additionalProperties 必须是布尔`);
+    }
+    const props = schema.properties;
+    if (props !== undefined && (props === null || typeof props !== 'object' || Array.isArray(props))) {
+      out.push(`${path}.properties 必须是对象`);
+    } else if (props !== undefined) {
+      for (const [name, sub] of Object.entries(props)) checkSchema(sub, `${path}.properties.${name}`, out);
+    }
+    if (schema.required !== undefined) {
+      if (!Array.isArray(schema.required) || schema.required.some((n) => typeof n !== 'string')) {
+        out.push(`${path}.required 必须是字符串数组`);
+      } else if (props && typeof props === 'object' && !Array.isArray(props)) {
+        for (const name of schema.required) {
+          if (!Object.hasOwn(props, name)) out.push(`${path}.required 引用了不存在的属性 ${name}`);
+        }
+      }
+    }
+  }
+  if (type === 'array' && schema.items !== undefined) checkSchema(schema.items, `${path}.items`, out);
+  if (Array.isArray(schema.enum) && schema.enum.length === 0) out.push(`${path}.enum 不能为空数组`);
+}
+
+/** 校验一个已注册工具；返回违规描述（空数组 = 合规）。 */
+function toolSchemaViolations(tool) {
+  const out = [];
+  const parameters = tool.parameters;
+  if (parameters === null || typeof parameters !== 'object' || Array.isArray(parameters)) {
+    out.push('parameters 必须是对象');
+    return out;
+  }
+  if (parameters.type !== 'object') {
+    out.push(
+      `parameters.type 必须是 "object"（当前 ${JSON.stringify(parameters.type)}）` +
+        '—— 扁平属性映射会被原样透传给上游，触发 code 11129',
+    );
+  }
+  checkSchema(parameters, 'parameters', out);
+  checkSchema(tool.output.schema, 'output.schema', out);
+  return out;
+}
+
+// ── 假宿主 ────────────────────────────────────────────────────────────────
+
+/**
+ * 造一个假 ctx。
+ *
+ * `inject` 要同步回调（真实 Cordis 是 effect 里的），这里直接调用以便 apply
+ * 返回后就能拿到注册结果。
+ */
+function makeCtx({ controller } = {}) {
+  const tools = new Map();
+  const ctx = {
+    logger: undefined,
+    get(name) {
+      if (name === 'sessionController') return controller;
+      if (name === 'agents') return { get: () => undefined };
+      return undefined;
+    },
+    inject(deps, callback) {
+      callback({
+        effect: (fn) => fn(),
+        tools: {
+          register(spec) {
+            tools.set(spec.name, spec);
+            return () => tools.delete(spec.name);
+          },
+        },
+      });
+      return () => {};
+    },
+    effect(fn) {
+      return fn();
+    },
+  };
+  return { ctx, tools };
+}
+
+/** 造一个假顾问 agent：投递后往会话里追加事件，模拟「答完了」。 */
+function makeAgent({ id = 'session-advisor', cwd = 'D:\\work', answer = '顾问的答案', hang = false } = {}) {
+  const log = [];
+  const agent = {
+    id,
+    session: {
+      id,
+      header: { cwd },
+      get seq() {
+        return log.length;
+      },
+      snapshotEvents(from = 0) {
+        return log.slice(from);
+      },
+    },
+    phase: { kind: 'idle' },
+    get status() {
+      return this.phase.kind === 'idle' ? 'idle' : 'running';
+    },
+    sent: [],
+    followup(message) {
+      this.sent.push(message);
+      this.phase = { kind: 'running' };
+      if (hang) return;
+      // 同步把回答写进会话，然后回到 idle——真实宿主是异步的，
+      // 但这里只关心「边界取到的事件区间对不对」。
+      log.push({ type: 'user/message', data: { message } });
+      log.push({
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: answer }] } },
+      });
+      queueMicrotask(() => {
+        this.phase = { kind: 'idle' };
+      });
+    },
+    async whenIdle() {
+      while (this.phase.kind !== 'idle') await new Promise((r) => setTimeout(r, 1));
+    },
+  };
+  return agent;
+}
+
+/** 造一个假 sessionController。 */
+function makeController({ existing, createResult, resolveErrors = {} } = {}) {
+  const state = { existing, created: [], resolveCalls: [] };
+  return {
+    state,
+    async resolveAgent(sessionId) {
+      state.resolveCalls.push(sessionId);
+      const err = resolveErrors[sessionId];
+      if (err) return { error: err };
+      const agent = state.existing?.id === sessionId ? state.existing : undefined;
+      if (agent) return { agent };
+      return { error: { code: 'session/not-found', message: 'no such session' } };
+    },
+    async create(request) {
+      state.created.push(request);
+      if (createResult === undefined) return { sessionId: 'session-new' };
+      return createResult;
+    },
+  };
+}
+
+/**
+ * 起一个被测插件实例。
+ *
+ * 注意 `seed` 的必要性：顾问会话 id 是**记在状态文件里**的，插件只认自己
+ * 记录过的那个顾问。所以想测「复用已有顾问」，必须先把这个 id 写进状态，
+ * 光给一个活着的 agent 是不够的。
+ */
+async function setup({ controller, name, seed, config = {} } = {}) {
+  const file = join(sandbox, `${name}.json`);
+  if (seed) {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(file, JSON.stringify(seed), 'utf8');
+  }
+  const { ctx, tools } = makeCtx({ controller });
+  apply(ctx, { stateFile: file, ...config });
+  return { ctx, tools, file };
+}
+
+/** 让 controller 能解析出某个新建的 agent。 */
+function teach(controller, agent) {
+  const original = controller.resolveAgent.bind(controller);
+  controller.resolveAgent = async (id) => (id === agent.id ? { agent } : original(id));
+}
+
+// ── 1. 工具注册 ───────────────────────────────────────────────────────────
+
+{
+  const { ctx, tools } = makeCtx({ controller: makeController({}) });
+  apply(ctx, {});
+  ok(tools.has('ask_advisor'), '注册了 ask_advisor');
+  ok(tools.has('advisor_status'), '注册了 advisor_status');
+
+  const tool = tools.get('ask_advisor');
+
+  // register() 自己不查 parameters，这里不拦就会一路漏到上游变成 400。
+  for (const [name, registered] of tools) {
+    const violations = toolSchemaViolations(registered);
+    ok(
+      violations.length === 0,
+      `${name} 的 schema 落在宿主支持子集内${violations.length === 0 ? '' : `\n    ${violations.join('\n    ')}`}`,
+    );
+  }
+
+  eq(tool.parameters.type, 'object', 'ask_advisor 的 parameters 是完整 JSON Schema');
+  eq(Object.keys(tool.parameters.properties), ['question', 'situation', 'tried', 'context'], 'ask_advisor 参数表');
+  eq(tool.parameters.required, ['question'], 'question 是唯一必填项');
+  eq(tool.parameters.properties.question.type, 'string', 'question 是字符串');
+  eq(tool.parameters.properties.situation.required, undefined, '选填项不写逐属性 required');
+  eq(tool.isConcurrencySafe(), false, '咨询按不安全处理（要串行）');
+  ok(typeof tool.description === 'string' && tool.description.length > 50, '工具描述有实质内容');
+
+  const status = tools.get('advisor_status');
+  eq(typeof status.execute, 'function', 'advisor_status 有 execute');
+  eq(status.parameters.type, 'object', 'advisor_status 的 parameters 也是完整 JSON Schema');
+  eq(status.parameters.properties.reset.type, 'boolean', 'reset 是布尔');
+  eq(status.parameters.required, undefined, 'advisor_status 没有必填项');
+  eq(typeof status.output.schema, 'object', 'advisor_status 声明 output schema');
+}
+
+// 校验器本身必须抓得住这个坑——护栏抓不住 bug 就等于没有护栏。
+// 下面三份都是 2026-10-14 真实出现过的畸形形态。
+{
+  const flat = {
+    parameters: { question: { type: 'string', required: true, description: 'x' } },
+    output: { schema: { type: 'object', additionalProperties: true } },
+  };
+  const caught = toolSchemaViolations(flat);
+  ok(caught.length > 0, '校验器能识别扁平 parameters 写法');
+  ok(
+    caught.some((v) => v.includes('parameters.type 必须是 "object"')),
+    '诊断信息点明 parameters.type 必须是 object',
+  );
+
+  const nested = {
+    parameters: { type: 'object', properties: { q: { type: 'string', required: true } } },
+    output: { schema: { type: 'object', additionalProperties: true } },
+  };
+  ok(
+    toolSchemaViolations(nested).some((v) => v.includes('required 只能出现在 object 节点上')),
+    '校验器能识别写在属性里的 required',
+  );
+
+  const badOutput = {
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'json' } },
+  };
+  ok(toolSchemaViolations(badOutput).length > 0, '校验器能识别 output.schema 里的 { type: "json" }');
+}
+
+// enabled:false 时一个工具都不注册
+{
+  const { ctx, tools } = makeCtx({ controller: makeController({}) });
+  apply(ctx, { enabled: false });
+  eq(tools.size, 0, 'enabled=false 时不注册工具');
+}
+
+// ── 2. 正常一次咨询 ───────────────────────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-keep', cwd: 'D:\\work', answer: '把正则拆成两步' });
+  const controller = makeController({ existing: advisor });
+  const { tools } = await setup({
+    controller,
+    name: 'a',
+    seed: { advisorSessionId: 'session-keep' },
+  });
+
+  const result = await tools.get('ask_advisor').execute(
+    { question: '我的正则为什么匹配不上？', situation: '在解析 YAML' },
+    { agent: { session: { id: 'session-caller', header: { cwd: 'D:\\work' } } } },
+  );
+
+  eq(result.ok, true, '正常咨询 ok=true');
+  eq(result.answer, '把正则拆成两步', '答案取自顾问的 assistant 消息');
+  eq(result.advisor.sessionId, 'session-keep', '复用已有顾问会话');
+  eq(controller.state.created.length, 0, '有可用顾问时不新建会话');
+  eq(advisor.sent.length, 1, '向顾问投递了一条消息');
+  eq(advisor.sent[0].role, 'user', '投递的消息 role=user');
+  ok(typeof advisor.sent[0].id === 'string' && advisor.sent[0].id !== '', '投递的消息带非空 id（否则会话会损坏）');
+  ok(
+    advisor.sent[0].content[0].text.includes('我的正则为什么匹配不上？'),
+    '提示词里含求助方的问题',
+  );
+  ok(
+    advisor.sent[0].content[0].text.includes('session-caller'),
+    '提示词里含求助方会话 id',
+  );
+}
+
+// ── 3. 顾问在别的目录：必须告知 ───────────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-other', cwd: 'D:\\somewhere-else' });
+  const controller = makeController({ existing: advisor });
+  const { tools } = await setup({
+    controller,
+    name: 'b',
+    seed: { advisorSessionId: 'session-other' },
+  });
+
+  await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-caller', header: { cwd: 'D:\\work' } } } },
+  );
+
+  const text = advisor.sent[0].content[0].text;
+  ok(text.includes('## 工作目录'), '顾问目录不同时提示词含工作目录段');
+  ok(text.includes('D:\\work') && text.includes('D:\\somewhere-else'), '工作目录段同时列出两边');
+}
+
+// ── 4. 必须新建顾问时 ─────────────────────────────────────────────────────
+
+{
+  const controller = makeController({ createResult: { sessionId: 'session-fresh' } });
+  const created = makeAgent({ id: 'session-fresh', cwd: 'D:\\work', answer: '新建顾问的答案' });
+  teach(controller, created);
+
+  const { tools } = await setup({ controller, name: 'c' });
+
+  const result = await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-caller', header: { cwd: 'D:\\work' } } } },
+  );
+
+  eq(controller.state.created.length, 1, '没有顾问时创建了一个');
+  eq(controller.state.created[0].cwd, 'D:\\work', '新顾问的 cwd 跟随求助方');
+  eq(result.answer, '新建顾问的答案', '新顾问的答案正确取回');
+  eq(created.sent.length, 2, '新顾问先收自我介绍，再收咨询请求');
+  ok(created.sent[0].content[0].text.includes('第二意见'), '第一条是自我介绍');
+}
+
+// ── 5. 顾问恢复失败：应重建，而不是报错 ───────────────────────────────────
+
+{
+  const controller = makeController({
+    createResult: { sessionId: 'session-reborn' },
+    resolveErrors: { 'session-dead': { code: 'gateway/internal', message: 'resume 失败' } },
+  });
+  const reborn = makeAgent({ id: 'session-reborn', cwd: 'D:\\work', answer: '重建后的答案' });
+  teach(controller, reborn);
+
+  const { tools } = await setup({
+    controller,
+    name: 'd',
+    seed: { advisorSessionId: 'session-dead' },
+  });
+
+  const result = await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-caller', header: { cwd: 'D:\\work' } } } },
+  );
+
+  eq(controller.state.created.length, 1, '旧顾问恢复失败后重建了');
+  eq(result.answer, '重建后的答案', '重建后正常取得答案');
+  ok(controller.state.resolveCalls.includes('session-dead'), '确实尝试过恢复旧顾问');
+}
+
+// ── 6. 顾问递归保护 ───────────────────────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-advisor-self' });
+  const controller = makeController({ existing: advisor });
+  const { tools } = await setup({
+    controller,
+    name: 'e',
+    seed: { advisorSessionId: 'session-advisor-self' },
+  });
+
+  const result = await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-advisor-self' } } },
+  );
+
+  ok(result.error !== undefined, '顾问自己调用时返回错误对象');
+  eq(advisor.sent.length, 0, '顾问自己调用时不投递任何消息（不递归）');
+}
+
+// ── 7. 参数与上下文错误 ───────────────────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-p' });
+  const { tools } = await setup({
+    controller: makeController({ existing: advisor }),
+    name: 'f',
+    seed: { advisorSessionId: 'session-p' },
+  });
+  const tool = tools.get('ask_advisor');
+
+  const noSession = await tool.execute({ question: 'Q' }, undefined);
+  ok(noSession.error !== undefined, '拿不到会话 id 时返回 error');
+
+  const noQuestion = await tool.execute({ question: '   ' }, { agent: { session: { id: 's1' } } });
+  ok(noQuestion.error !== undefined, '空问题时返回 error');
+
+  eq(advisor.sent.length, 0, '参数非法时不投递');
+}
+
+// ── 8. 顾问卡住不动：超时返回，不挂死 ─────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-hang', hang: true });
+  const { tools } = await setup({
+    controller: makeController({ existing: advisor }),
+    name: 'g',
+    seed: { advisorSessionId: 'session-hang' },
+    config: { waitMs: 1500 },
+  });
+
+  const t0 = Date.now();
+  const result = await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-caller' } } },
+  );
+  const elapsed = Date.now() - t0;
+
+  eq(result.ok, false, '顾问不结束时 ok=false');
+  eq(result.timedOut, true, '标记 timedOut=true');
+  ok(result.note !== undefined, '超时时给出说明');
+  ok(elapsed >= 1400 && elapsed < 6000, `超时按 waitMs 生效（实测 ${elapsed}ms）`);
+}
+
+// ── 9. 顾问答了但没留文字 ─────────────────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-silent', answer: '' });
+  const { tools } = await setup({
+    controller: makeController({ existing: advisor }),
+    name: 'h',
+    seed: { advisorSessionId: 'session-silent' },
+  });
+
+  const result = await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-caller' } } },
+  );
+
+  eq(result.ok, false, '空回答时 ok=false');
+  ok(result.note !== undefined, '空回答给出说明');
+}
+
+// ── 10. 两次并发咨询同一顾问：必须串行，答案不能串 ───────────────────────
+
+{
+  // 让顾问的回答随投递次序递变，任何交叉都会立刻暴露
+  let n = 0;
+  const log = [];
+  const advisor = {
+    id: 'session-serial',
+    session: {
+      id: 'session-serial',
+      header: { cwd: 'D:\\work' },
+      get seq() {
+        return log.length;
+      },
+      snapshotEvents(from = 0) {
+        return log.slice(from);
+      },
+    },
+    phase: { kind: 'idle' },
+    get status() {
+      return this.phase.kind === 'idle' ? 'idle' : 'running';
+    },
+    followup(message) {
+      const mine = ++n;
+      this.phase = { kind: 'running' };
+      setTimeout(() => {
+        log.push({ type: 'user/message', data: { message } });
+        log.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: `回答${mine}` }] } },
+        });
+        this.phase = { kind: 'idle' };
+      }, 30);
+    },
+    async whenIdle() {
+      while (this.phase.kind !== 'idle') await new Promise((r) => setTimeout(r, 2));
+    },
+  };
+
+  const { tools } = await setup({
+    controller: makeController({ existing: advisor }),
+    name: 'i',
+    seed: { advisorSessionId: 'session-serial' },
+  });
+  const tool = tools.get('ask_advisor');
+
+  const [a, b] = await Promise.all([
+    tool.execute({ question: '第一个问题' }, { agent: { session: { id: 'session-1' } } }),
+    tool.execute({ question: '第二个问题' }, { agent: { session: { id: 'session-2' } } }),
+  ]);
+
+  eq(a.answer, '回答1', '第一个咨询拿到第一次回答');
+  eq(b.answer, '回答2', '第二个咨询拿到第二次回答（未被串味）');
+}
+
+// ── 11. advisor_status ───────────────────────────────────────────────────
+
+{
+  const advisor = makeAgent({ id: 'session-status' });
+  const { tools, file } = await setup({
+    controller: makeController({ existing: advisor }),
+    name: 'j',
+    seed: { advisorSessionId: 'session-status' },
+  });
+  const status = tools.get('advisor_status');
+
+  const before = await status.execute({});
+  eq(before.advisorSessionId, 'session-status', '读出已记录的顾问 id');
+  eq(before.consults, 0, '尚未咨询时计数为 0');
+  ok(typeof before.stateFile === 'string' && before.stateFile.includes('j.json'), '报告状态文件位置');
+
+  await tools.get('ask_advisor').execute(
+    { question: 'Q' },
+    { agent: { session: { id: 'session-caller' } } },
+  );
+
+  const after = await status.execute({});
+  eq(after.consults, 1, '咨询计数递增');
+
+  const reset = await status.execute({ reset: true });
+  eq(reset.advisorSessionId, null, 'reset 后清空顾问记录');
+  eq(reset.previousAdvisorSessionId, 'session-status', 'reset 报告被丢弃的顾问 id');
+  ok(file.length > 0, '状态文件路径可用');
+}
+
+// ── 12. 状态文件损坏时不该起不来 ──────────────────────────────────────────
+
+{
+  const { writeFileSync } = await import('node:fs');
+  const file = join(sandbox, 'k.json');
+  writeFileSync(file, '{ 这不是 json', 'utf8');
+
+  const { ctx, tools } = makeCtx({ controller: makeController({}) });
+  apply(ctx, { stateFile: file });
+  ok(tools.has('ask_advisor'), '状态文件损坏时插件照常注册');
+
+  const status = await tools.get('advisor_status').execute({});
+  eq(status.advisorSessionId, null, '损坏状态按空处理');
+}
+
+// ── 结果 ──────────────────────────────────────────────────────────────────
+
+rmSync(sandbox, { recursive: true, force: true });
+
+const total = pass + failures.length;
+if (failures.length === 0) {
+  console.log(`HOST-MOCK: PASS  ${pass}/${total}`);
+  process.exit(0);
+}
+console.log(`HOST-MOCK: FAIL  ${pass}/${total} pass, ${failures.length} fail`);
+for (const f of failures) console.log(`  ✘ ${f}`);
+process.exit(1);
