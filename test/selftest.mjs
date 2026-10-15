@@ -10,7 +10,18 @@
  * 运行：node test/selftest.mjs
  */
 
-import { ADVISOR_INTRO, advisorTitle, buildConsultPrompt, extractAnswer, clamp, leadingChars } from '../lib/compose.js';
+import {
+  ADVISOR_INTRO,
+  advisorTitle,
+  buildConsultPrompt,
+  extractAnswer,
+  clamp,
+  leadingChars,
+  humanGap,
+  summarizeSession,
+  renderPrincipalReport,
+  renderNotes,
+} from '../lib/compose.js';
 
 let pass = 0;
 const failures = [];
@@ -198,6 +209,152 @@ eq(advisorTitle('标题', 1, ''), '标题', '空前缀时只剩标题，不炸')
 eq(advisorTitle('标题', 0), '辅助标题', '槽位 0 当作 1（不加数字）');
 eq(advisorTitle('标题', -5), '辅助标题', '负数槽位当作 1');
 eq(advisorTitle('  空格  开头', 1), '辅助空格', '标题先归一化空白，且不留尾随空格');
+
+// ── humanGap：把毫秒说成人话 ────────────────────────────────────────────
+//
+// 这一组存在的理由：顾问判断「上次聊完过去多久了」全靠这个换算，而模型从
+// 时间戳做除法是会算错的。宁可在纯函数里钉死它。
+eq(humanGap(0), '0 秒', '0 毫秒 = 0 秒');
+eq(humanGap(30_000), '30 秒', '不足一分钟按秒');
+eq(humanGap(59_999), '59 秒', '59.999 秒仍是 59 秒，不进位成分钟');
+eq(humanGap(60_000), '1 分钟', '整一分钟');
+eq(humanGap(90_000), '1 分钟', '分针向下取整，不四舍五入');
+eq(humanGap(3_600_000), '1 小时', '整一小时不带「0 分钟」');
+eq(humanGap(8_100_000), '2 小时 15 分钟', '小时+分钟');
+eq(humanGap(86_400_000), '1 天', '整一天不带「0 小时」');
+eq(humanGap(180_000_000), '2 天 2 小时', '天+小时');
+eq(humanGap(-1), '未知', '负数间隔视为未知，不产出「-1 秒」');
+eq(humanGap(NaN), '未知', 'NaN 安全');
+eq(humanGap(undefined), '未知', 'undefined 安全');
+eq(humanGap('abc'), '未知', '非数字安全');
+
+// ── summarizeSession：从事件流里读出「它在干什么」 ──────────────────────
+//
+// 造事件的小工具。宿主的信封是 `{type, seq, time, data}`。
+const ev = (type, seq, time, data) => ({ type, seq, time, data });
+const usr = (text, seq, time) => ev('user/message', seq, time, { content: [{ type: 'text', text }] });
+const asst = (text, seq, time) => ev('assistant/message', seq, time, { message: { content: [{ type: 'text', text }] } });
+const tool = (name, args, seq, time) => ev('tool/call', seq, time, { name, arguments: args });
+
+const T0 = 1_800_000_000_000;
+
+// 空输入不能炸，且每个字段都该有确定的初值（而不是 undefined 漏进报告里）
+const empty = summarizeSession([], { now: T0 });
+eq(empty.eventCount, 0, '空事件流：计数为 0');
+eq(empty.turn, null, '空事件流：turn 为 null');
+eq(empty.lastUser, null, '空事件流：没有 lastUser');
+eq(empty.lastAssistant, null, '空事件流：没有 lastAssistant');
+eq(empty.idleMs, null, '空事件流：空闲时长为 null（而不是 0，0 会被误读成「刚刚活动过」）');
+eq(summarizeSession(null, { now: T0 }).eventCount, 0, 'null 事件流安全');
+eq(summarizeSession('nope', { now: T0 }).eventCount, 0, '非数组事件流安全');
+
+const flow = [
+  ev('turn/start', 5, T0, { turn: 3 }),
+  ev('step/start', 7, T0 + 10, { turn: 3, step: 2 }),
+  usr('去修一下那个 bug', 9, T0 + 20),
+  tool('ops_bash', '{"command":"ls"}', 23, T0 + 30),
+  asst('我先看看目录结构。', 22, T0 + 40),
+];
+const s1 = summarizeSession(flow, { now: T0 + 100, lastConsultAt: 0 });
+eq(s1.eventCount, 5, '事件计数含所有类型');
+eq(s1.turn, 3, '取到当前轮次');
+eq(s1.step, 2, '取到当前步');
+eq(s1.lastUser.text, '去修一下那个 bug', '取到最后一条人类输入');
+eq(s1.lastAssistant.text, '我先看看目录结构。', '取到最后一段助手输出');
+eq(s1.toolCount, 1, '工具调用计数');
+eq(s1.tools[0].name, 'ops_bash', '工具名');
+eq(s1.tools[0].args, '{"command":"ls"}', '工具参数原文');
+eq(s1.lastActivityAt, T0 + 40, '最后活动时间取所有事件的最大 time');
+eq(s1.idleMs, 60, '空闲时长 = now - 最后活动时间');
+eq(s1.idleText, '0 秒', '空闲时长的人话形式也一并给出');
+eq(s1.sinceLastConsultMs, null, '没求助过时，距上次求助为 null');
+eq(s1.topicMoved, null, '没求助过时，话题是否继续为 null（不是 false）');
+
+// 「话题有没有往前走」＝ 上次求助之后有没有新的人类输入。
+// 这是时间先后的事实判断，不是语义判断——语义留给顾问自己。
+const afterConsult = summarizeSession(
+  [...flow, usr('不是那个，是另一个函数', 40, T0 + 200)],
+  { now: T0 + 300, lastConsultAt: T0 + 100 },
+);
+eq(afterConsult.topicMoved, true, '求助之后又有新输入 → 话题在往前走');
+eq(afterConsult.sinceLastConsultMs, 200, '距上次求助的间隔');
+
+const noNewInput = summarizeSession(flow, { now: T0 + 300, lastConsultAt: T0 + 200 });
+eq(noNewInput.topicMoved, false, '求助之后没有新输入 → 它停在那时的状态里');
+
+// 求助时刻正好晚于最后一条输入：不能算「往前走」
+const boundary = summarizeSession(flow, { now: T0 + 300, lastConsultAt: T0 + 40 });
+eq(boundary.topicMoved, false, '最后输入早于求助时刻（相等边界除外）→ 不算新进展');
+
+// 工具列表要截断并保留最近的：顾问关心「卡在哪一步」，不是完整调用史
+const many = summarizeSession(
+  Array.from({ length: 30 }, (_, i) => tool(`t${i}`, '{}', i, T0 + i)),
+  { now: T0 + 100, toolLimit: 3 },
+);
+eq(many.tools.length, 3, '工具列表按上限截断');
+eq(many.tools.map((t) => t.name).join(','), 't27,t28,t29', '截断时保留最近的几次（丢最旧的）');
+eq(many.toolCount, 30, '截断的是列表，总数仍然如实统计');
+
+// 只有图片、没有文字的 user 消息也是「对方说了话」，时间点必须记下来，
+// 否则 topicMoved 会被判成 false，顾问会以为对方没动过。
+const imageOnly = summarizeSession(
+  [ev('user/message', 9, T0 + 500, { content: [{ type: 'image', path: 'a.png' }] })],
+  { now: T0 + 600, lastConsultAt: T0 + 100 },
+);
+eq(imageOnly.lastUser.empty, true, '无文字的人类输入标记为空正文');
+eq(imageOnly.lastUser.at, T0 + 500, '无文字输入仍记录时间');
+eq(imageOnly.topicMoved, true, '无文字输入也算话题在往前走');
+
+// 超长正文要截断（事件流可能含整篇文件内容，全塞进报告会撑爆上下文）
+const huge = summarizeSession([usr('x'.repeat(5000), 9, T0)], { now: T0 });
+ok(huge.lastUser.text.length <= 2000, '超长的人类输入被截断');
+ok(huge.lastUser.text.includes('已截断'), '截断留有痕迹，顾问不会以为原文就这么短');
+
+// ── renderPrincipalReport：给顾问读的实况报告 ───────────────────────────
+const report = renderPrincipalReport(
+  summarizeSession(flow, { now: T0 + 100, lastConsultAt: T0 + 50 }),
+  { sessionId: 'session-abc', title: '修 bug', running: true, cwd: 'D:\\work' },
+);
+ok(report.includes('session-abc'), '报告含会话 id');
+ok(report.includes('修 bug'), '报告含会话标题');
+ok(report.includes('D:\\work'), '报告含工作目录');
+ok(report.includes('正在运行'), 'running=true 时明说在跑');
+ok(!report.includes('空闲'), 'running=true 时不能同时说空闲');
+ok(report.includes('第 3 轮第 2 步'), '报告含进度');
+ok(report.includes('去修一下那个 bug'), '报告含最近的人类输入');
+ok(report.includes('我先看看目录结构。'), '报告含最后的助手输出');
+ok(report.includes('ops_bash'), '报告含最近的工具调用');
+ok(report.includes('没有新的人类输入'), '未换话题时如实说明');
+
+// running 未知时必须说未知，不能默认成「空闲」或「正在跑」——那是编造。
+const unknownRun = renderPrincipalReport(summarizeSession(flow, { now: T0 }), { sessionId: 's', running: null });
+ok(unknownRun.includes('未知'), 'running 为 null 时如实报未知');
+ok(!unknownRun.includes('正在运行'), 'running 未知时不谎称在跑');
+
+// 从没求助过
+const firstContact = renderPrincipalReport(summarizeSession(flow, { now: T0 }), { sessionId: 's', running: false });
+ok(firstContact.includes('第一次接触'), '没求助过时说明是第一次');
+
+// 报告也要有上限（事件流可能很长）
+ok(renderPrincipalReport(summarizeSession(flow, { now: T0 }), { sessionId: 's' }, 200).length <= 200, '报告遵守字符上限');
+eq(renderPrincipalReport(null, { sessionId: 's' }, 9999).includes('【主会话实况】'), true, 'summary 为 null 时不炸、仍给出标题');
+
+// ── renderNotes：留给主会话的便条 ───────────────────────────────────────
+eq(renderNotes([]), '', '没有便条时返回空串（调用方据此不往结果里加字段）');
+eq(renderNotes(null), '', 'null 安全');
+const notes = renderNotes(
+  [
+    { at: T0, slot: 1, text: '你在第 3 步重复删了同一个目录，建议先看一眼它是否存在。' },
+    { at: T0 + 60_000, slot: 2, text: '第二个顾问：这个报错其实来自缓存。' },
+  ],
+  T0 + 120_000,
+);
+ok(notes.includes('顾问'), '便条抬头点明来源是顾问');
+ok(notes.includes('不会打断') || notes.includes('看不到你后来做了什么'), '便条说明它不是实时、可能已过时');
+ok(notes.includes('2 分钟前留下'), '便条带新鲜度');
+ok(notes.includes('第 2 号顾问'), '便条标出槽位（多个顾问时能分辨谁写的）');
+ok(!notes.includes('第 1 号顾问'), '一号顾问不加多余标注');
+ok(notes.includes('重复删了同一个目录'), '便条正文原样带出');
 
 // ── 结果 ────────────────────────────────────────────────────────────────
 const total = pass + failures.length;

@@ -2,6 +2,8 @@
 
 > **给 DeepSeek Harness 的「第二意见」插件**——一个会话卡住时，把问题交给另一个**独立会话**单独思考，把方案拿回来。
 > 求助方在自己的工具调用里**同步**等顾问答完，答案作为**工具结果**直接返回：不需要唤醒闲置会话，也不冒充用户发言。
+>
+> 反方向也通：用户可以**跑到顾问窗里**让它去看看主会话在干什么、留一张便条，全程不打断主会话。
 
 [English](README.en.md) | 中文
 
@@ -96,27 +98,6 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 
 ---
 
-## 触发方式（双路线）
-
-### 1. 会话自己判断卡住了 → 直接调工具
-
-`ask_advisor` 的 description 里写明了适用场景，模型会自行判断：
-
-- 反复试错、来回改同一处却进展不顺；
-- 同一个错误以不同形式重复出现；
-- 用户提示「卡住了」「换个思路」。
-
-### 2. 用户说一声 → 用户的话进到上下文，会话同样调这个工具
-
-用户不需要做任何配置，说「你卡住了，问问顾问」即可。
-
-> **为什么不做「插件自动监听行为流发现打转就介入」？**
-> 因为打转当下每一步都像在推进，站在里面的会话识别不出自己在打转——这正是
-> 需要外部视角的原因。真要做被动检测，得另写一个**站在外面读会话日志**的
-> 观察者，那是另一个插件的范围。本插件选择让触发显式。
-
----
-
 ## 工具
 
 ### `ask_advisor`
@@ -158,9 +139,81 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 返回 `callerSessionId` / `callerTitle` / `advisors`（数组，每项含 `slot` /
 `sessionId` / `title` / `cwd` / `live` / `consults` / `lastConsultAt` /
 `createdAt`）/ `droppedAdvisorSessionIds` / `legacyAdvisorSessionId` /
-`maxAdvisors` / `stateFile`。
+`maxAdvisors` / `stateFile` / `notes`。
 
-### 顾问会话怎么命名
+### `advisor_watch`（顾问专用）
+
+上面两个工具是「求助方 → 顾问」方向；这个和下面的 `advisor_note` 是**反方向**：
+用户自己跑到顾问窗里说「去看看主会话在干什么、搭把手」。
+
+查看**你正在辅助的那个主会话**现在在干什么：在不在跑、进度停在哪一步、距上次
+求助过了多久、有没有换话题、最近说过什么、最后调了哪些工具。
+
+| 参数 | 必需 | 说明 |
+| --- | --- | --- |
+| `detail` | ⭕ | `summary`（默认）给完整实况；`tools` 只给最近的工具调用清单 |
+
+**全程只读。** 它走 `sessionController.inspect`——宿主的注释明确写着
+*without activating its Agent*：会话已附加时读内存快照，冷会话读持久化，两种情况
+都**不会 resume、不会唤醒对方、不会往对方的日志里写任何东西**。运行状态另从
+`sessionController.list()` 取（同样不 resume）。这正是「不打断主会话思考」的技术保障。
+
+返回 `{ ok, principal: { sessionId, slot, title, running, cwd, lastActivityAt,
+idleMs, sinceLastConsultMs, topicMoved }, report, note }`。`report` 是给人读的
+散文实况；`running` 拿不到时是 `null`，报告里如实写「运行状态未知」——**绝不默认
+成在跑或空闲，那是编造**。
+
+### `advisor_note`（顾问专用）
+
+给你辅助的那个主会话留一条便条。主会话**下次**调用 `ask_advisor` 或
+`advisor_status` 时会连同工具结果一起看到它，从而知道你在旁边看着、以及你发现了什么。
+
+| 参数 | 必需 | 说明 |
+| --- | --- | --- |
+| `text` | ✅ | 便条正文：你观察到了什么、建议它做什么、依据是什么 |
+
+便条**只是留言**：它不弹窗、不改变主会话正在进行的思考，要等主会话自己下一次
+调用才会读到。所以写的时候把结论和依据一起写清楚——主会话看到时可能已经又往前
+走了一段，你得让它能自己判断这条是否还适用。
+
+便条按**求助会话**归档，队列上限 `maxNotes`（默认 5 条，超限丢最旧——它们也最
+可能已经过时），并且是**消费式**的：主会话读过就清空，不会每调一次工具就重新看到。
+
+> **谁能调这两个工具？** 只有**本插件创建出来的顾问会话**能——靠反查状态文件里
+> `advisors[求助方].slots[]` 判定归属，不另开一份记录。别的会话调它们会直接报错
+> （它们整个语义都建立在「我是在辅助某个主会话」这个前提上；放开只会让任意会话
+> 拿到窥探别人的能力）。主会话想求助请用 `ask_advisor`。
+
+---
+
+## 触发方式（三条路线）
+
+### 1. 会话自己判断卡住了 → 直接调工具
+
+`ask_advisor` 的 description 里写明了适用场景，模型会自行判断：
+
+- 反复试错、来回改同一处却进展不顺；
+- 同一个错误以不同形式重复出现；
+- 用户提示「卡住了」「换个思路」。
+
+### 2. 用户说一声 → 用户的话进到上下文，会话同样调这个工具
+
+用户不需要做任何配置，说「你卡住了，问问顾问」即可。
+
+### 3. 反过来：用户自己跑到顾问窗里下命令
+
+用户不想打断主会话的思考时，可以直接**在顾问会话里**说「去看看它在干什么」——
+顾问用 `advisor_watch` 读实况、用 `advisor_note` 留便条，全程不碰主会话的上下文。
+主会话下次自己调工具时就会读到那条便条。
+
+> **为什么不做「插件自动监听行为流发现打转就介入」？**
+> 因为打转当下每一步都像在推进，站在里面的会话识别不出自己在打转——这正是
+> 需要外部视角的原因。真要做被动检测，得另写一个**站在外面读会话日志**的
+> 观察者，那是另一个插件的范围。本插件选择让触发显式。
+
+---
+
+## 顾问会话怎么命名
 
 顾问会话的标题由插件写入，规则是 **`辅助` + 求助会话标题的前三字**（前缀可用
 `advisorLabel` 改）；同一个求助会话的第 2、3 个顾问在后面加槽位号：
@@ -198,6 +251,10 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 | `stateFile` | `''` | 状态文件路径；空则用 `$DSH_HOME/second-opinion/state.json` |
 | `advisorLabel` | `辅助` | 顾问会话标题的前缀，后面接求助会话标题前三字 |
 | `maxAdvisors` | `9` | 一个求助会话最多有几个顾问槽位 |
+| `maxWatchedTools` | `12` | `advisor_watch` 报告里最多列几条工具调用（计数仍是全部的） |
+| `maxReportChars` | `12000` | `advisor_watch` 报告的字符上限 |
+| `maxNotes` | `5` | 每个求助会话的便条队列上限，超限丢最旧 |
+| `maxNoteChars` | `4000` | 单条便条的字符上限 |
 
 超长内容会**带标记截断**（`…（内容过长，已截断，原长 N 字符）`）——静默截断会让
 模型以为内容本来就这么短，基于不完整信息下结论。
@@ -218,13 +275,15 @@ DSH 已经有跨会话通信能力，但两条现成通道都做不成这件事�
 | 依赖 | 必需 | 说明 |
 | --- | --- | --- |
 | `ctx.sessionController` | ✅ | `create()` 新建顾问会话、`resolveAgent()` 恢复既有会话 |
-| `ctx.tools` | ✅ | 注册两个工具 |
+| `ctx.tools` | ✅ | 注册四个工具 |
 | `agent.followup(msg)` | ✅ | 把咨询请求投给顾问，**同时唤醒它** |
 | `agent.whenIdle()` / `agent.status` | ✅ | 等顾问答完 |
 | `agent.session.seq` / `snapshotEvents(from)` | ✅ | 划定答案边界、取回答 |
 | `ctx.agents.get(id)` | ⭕ 可选 | `advisor_status` 用它报 `live`；没有也不影响咨询 |
 | `ctx.sessionTitle.get(session)` | ⭕ 可选 | 读求助会话标题，作为顾问命名的来源；取不到就退回会话 id |
 | `sessionController.rename()` | ⭕ 可选 | 给顾问会话改名。宿主太旧没有它时直接跳过，咨询照常 |
+| `sessionController.inspect(id)` | ⭕ 可选 | `advisor_watch` 读主会话实况。**只读，不 resume Agent**；没有它时该工具返回失败 |
+| `sessionController.list()` | ⭕ 可选 | `advisor_watch` 取 `running`。同样不 resume；拿不到就报「运行状态未知」 |
 | `@deepseek-ai/dsh-llm` 的 `createUserMessage` | ⭕ 可选 | **刻意不用**：该包不在 profile 的 `node_modules` 里。本插件自己构造消息（见下） |
 
 **零运行时依赖**：只用 `node:fs` / `node:os` / `node:path` / `node:crypto`，
@@ -257,9 +316,10 @@ $DSH_HOME/second-opinion/state.json     # 默认；DSH_HOME 缺省时退回 ~/.d
 ```
 
 状态按**求助会话的 id** 归档在 `advisors` 下；每份档案记 `createdAt`、最近一次读到的
-求助方标题、以及 `slots[]` 槽位数组（每项含 `sessionId` / `title` / `cwd` /
-`createdAt` / `consults` / `lastConsultAt`）。另有 `version`，以及从旧版扁平结构升级时
-留下的 `legacyAdvisorSessionId` 痕迹。
+求助方标题、`notes[]` 便条队列（顾问侧 `advisor_note` 写、主会话侧读，读过即清）、
+以及 `slots[]` 槽位数组（每项含 `sessionId` / `title` / `cwd` /
+`createdAt` / `consults` / `lastConsultAt`）。另有 `version`（当前 `3`），以及从旧版
+扁平结构升级时留下的 `legacyAdvisorSessionId` 痕迹。
 
 文件损坏时按空表继续，最坏情况只是重新建顾问。删掉它 = 下次咨询新建顾问
 （旧会话本身还在）。
@@ -300,13 +360,17 @@ dsh plugin --profile <你的profile> add dsh-second-opinion
 npm test        # = node test/selftest.mjs && node test/host-mock.mjs
 ```
 
-- `test/selftest.mjs`（67 项）：`compose.js` 的纯函数——提示词组装、
+- `test/selftest.mjs`（135 项）：`compose.js` 的纯函数——提示词组装、
   答案提取（含流式兜底与「空消息不吞正文」）、截断标记、**顾问标题命名**
-  （前三字、多槽位加号、emoji 不劈半、空标题回退）。
-- `test/host-mock.mjs`（94 项）：用假 ctx 真实调用 `apply()`，
+  （前三字、多槽位加号、emoji 不劈半、空标题回退）、**时间间隔的人话换算**
+  （`humanGap`）、**主会话实况归纳**（`summarizeSession`）、**实况报告渲染**
+  （`renderPrincipalReport`）、**便条渲染**（`renderNotes`）。
+- `test/host-mock.mjs`（133 项）：用假 ctx 真实调用 `apply()`，
   覆盖工具注册、正常回答、超时、空回答、**递归保护**、顾问恢复失败、
   创建失败、**并发串行排队**、**分会话顾问互不干扰**、**标题改名只在需要时发**、
-  状态文件损坏恢复、旧版扁平状态迁移。
+  状态文件损坏恢复、旧版扁平状态迁移、**顾问侧两个工具**
+  （非顾问调用被拒、`detail` 分支、读不到目标会话时的失败返回、便条排队与上限丢最旧、
+  取走即清空、`ask_advisor` 也带回便条）。
 
 它当然不能替代真实会话跑通（假的 agent 不会真的思考），但能钉住**契约**：
 谁抛错、谁返回错误对象、答案从哪段事件区间取。

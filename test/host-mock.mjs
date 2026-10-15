@@ -143,14 +143,14 @@ function toolSchemaViolations(tool) {
  * `inject` 要同步回调（真实 Cordis 是 effect 里的），这里直接调用以便 apply
  * 返回后就能拿到注册结果。
  */
-function makeCtx({ controller, titles } = {}) {
+function makeCtx({ controller, titles, agents } = {}) {
   const tools = new Map();
   const ctx = {
     logger: undefined,
     get(name) {
       if (name === 'sessionController') return controller;
       if (name === 'sessionTitle') return titles;
-      if (name === 'agents') return { get: () => undefined };
+      if (name === 'agents') return agents ?? { get: () => undefined };
       return undefined;
     },
     inject(deps, callback) {
@@ -214,9 +214,16 @@ function makeAgent({ id = 'session-advisor', cwd = 'D:\\work', answer = '顾问�
   return agent;
 }
 
-/** 造一个假 sessionController。 */
-function makeController({ existing, createResult, resolveErrors = {} } = {}) {
-  const state = { existing, created: [], resolveCalls: [], renames: [] };
+/**
+ * 造一个假 sessionController。
+ *
+ * `inspections` 是「会话 id → 事件流」的表，`listItems` 是 `list()` 要返回的
+ * 会话行。两者都只是读接口：顾问侧的 `advisor_watch` 全靠它们拿实况，而它
+ * 必须**只读**——所以这里连写入入口都不提供，测试里也就没法（也不可能）
+ * 通过这两个方法改动任何东西。
+ */
+function makeController({ existing, createResult, resolveErrors = {}, inspections = {}, listItems = null } = {}) {
+  const state = { existing, created: [], resolveCalls: [], renames: [], inspected: [], listed: 0 };
   return {
     state,
     async resolveAgent(sessionId) {
@@ -235,6 +242,17 @@ function makeController({ existing, createResult, resolveErrors = {} } = {}) {
     async rename(request) {
       state.renames.push(request);
       return { title: request.title, seq: 1 };
+    },
+    async inspect(sessionId) {
+      state.inspected.push(sessionId);
+      const found = inspections[sessionId];
+      if (found === undefined) throw new Error(`session "${sessionId}" not found`);
+      return { meta: { id: sessionId, cwd: found.cwd ?? 'D:\\work' }, events: found.events ?? [] };
+    },
+    async list() {
+      state.listed += 1;
+      const items = listItems ?? state.inspected.map((id) => ({ sessionId: id, running: false }));
+      return { items };
     },
   };
 }
@@ -784,7 +802,146 @@ function teach(controller, agent) {
   eq('advisorSessionId' in upgraded, false, '旧 advisorSessionId 已删除');
   eq('consults' in upgraded, false, '旧全局 consults 已删除');
   eq('lastConsultAt' in upgraded, false, '旧全局 lastConsultAt 已删除');
-  eq(upgraded.version, 2, '状态版本升到 2');
+  // v3 给每个求助会话加了便条队列（顾问侧 advisor_note 写、主会话侧读）。
+  eq(upgraded.version, 3, '状态版本升到 3');
+  eq(Array.isArray(upgraded.advisors['session-new-caller'].notes), true, 'v3 给新建的档案带上便条队列');
+}
+
+// ── 17. 顾问侧两个工具（advisor_watch / advisor_note） ───────────────────
+//
+// 这一组是反方向的用法：用户跑到顾问窗里说「去看看主会话在干什么」。两个工具
+// 的语义都建立在「我是某个主会话的顾问」上，所以**必须先反查得到归属**才肯干
+// 活——不是顾问就直接报错。下面的断言重点在「挡住不该调的」和「读的确实是
+// 主会话的实况」，而不是报告文案本身（文案由 selftest 的纯函数断言管）。
+
+{
+  const T0 = 1_800_000_000_000;
+  const mkev = (type, seq, time, data) => ({ type, seq, time, data });
+
+  // 主会话的事件流。顾问看到的「实况」全从它算出来，所以这里刻意混了
+  // 人类输入、工具调用、助手输出三类，验证各自都进了报告。
+  const principal = [
+    mkev('turn/start', 5, T0, { turn: 4 }),
+    mkev('step/start', 7, T0 + 10, { turn: 4, step: 3 }),
+    mkev('user/message', 9, T0 + 20, { content: [{ type: 'text', text: '继续修那个下载 bug' }] }),
+    mkev('tool/call', 23, T0 + 30, { name: 'ops_bash', arguments: '{"command":"ls"}' }),
+    mkev('assistant/message', 22, T0 + 40, { message: { content: [{ type: 'text', text: '我看过了，是超时配置的问题。' }] } }),
+  ];
+
+  const controller = makeController({
+    inspections: { 'caller-1': { cwd: 'D:\\proj', events: principal } },
+    listItems: [{ sessionId: 'caller-1', running: true }],
+  });
+
+  // 上次求助发生在 T0+15，而最后一条人类输入在 T0+20——也就是说**求完助之后
+  // 对方又说了话**，顾问应当读到「话题还在往前走」。
+  const { tools } = await setup({
+    controller,
+    name: 'p',
+    seed: {
+      version: 2,
+      advisors: {
+        'caller-1': {
+          createdAt: 1,
+          title: '修下载',
+          slots: [{ sessionId: 'advisor-1', title: '辅助修下', cwd: null, createdAt: 1, consults: 1, lastConsultAt: T0 + 15 }],
+        },
+      },
+    },
+  });
+
+  const watch = tools.get('advisor_watch');
+  const note = tools.get('advisor_note');
+  ok(watch !== undefined, '注册了 advisor_watch');
+  ok(note !== undefined, '注册了 advisor_note');
+  for (const name of ['advisor_watch', 'advisor_note']) {
+    const violations = toolSchemaViolations(tools.get(name));
+    ok(violations.length === 0, `${name} 的 schema 落在宿主支持子集内${violations.length === 0 ? '' : `\n    ${violations.join('\n    ')}`}`);
+  }
+  eq(watch.parameters.properties.detail.enum, ['summary', 'tools'], 'advisor_watch 的 detail 是枚举');
+  eq(note.parameters.required, ['text'], 'advisor_note 的 text 必填');
+  eq(watch.isConcurrencySafe(), true, 'advisor_watch 只读，可并发');
+  eq(note.isConcurrencySafe(), true, 'advisor_note 只写自己的队列，可并发');
+
+  // 主会话（非顾问）来调要被挡住，而且要指路到正确的工具——它想求助就该用
+  // ask_advisor，而不是来窥探别的会话。
+  const refused = await watch.execute({}, { agent: { session: { id: 'caller-1' } } });
+  ok(typeof refused.error === 'string', '主会话调 advisor_watch 被拒');
+  ok(refused.error.includes('ask_advisor'), '拒绝信息指路到 ask_advisor');
+  const refusedNote = await note.execute({ text: 'x' }, { agent: { session: { id: 'caller-1' } } });
+  ok(typeof refusedNote.error === 'string', '主会话调 advisor_note 被拒');
+
+  // 顾问来调：拿到的是**它辅助的那个**会话的实况。
+  const got = await watch.execute({}, { agent: { session: { id: 'advisor-1' } } });
+  eq(got.ok, true, '顾问调用 advisor_watch 成功');
+  eq(got.principal.sessionId, 'caller-1', '报告指向它辅助的主会话');
+  eq(got.principal.slot, 1, '带上槽位号');
+  eq(got.principal.running, true, '运行状态取自 list()');
+  eq(got.principal.cwd, 'D:\\proj', '工作目录取自 inspect()');
+  eq(got.principal.topicMoved, true, '识别出「求完助之后对方又说了话」');
+  ok(got.report.includes('正在运行'), '报告明说正在运行');
+  ok(got.report.includes('继续修那个下载 bug'), '报告含最近人类输入原文');
+  ok(got.report.includes('我看过了'), '报告含它最后一段输出');
+  ok(got.report.includes('ops_bash'), '报告含工具调用');
+
+  // detail='tools' 只给工具清单，不带人类输入段落——顾问想快速扫一眼它调了
+  // 什么时用这个。
+  const toolsOnly = await watch.execute({ detail: 'tools' }, { agent: { session: { id: 'advisor-1' } } });
+  ok(toolsOnly.report.includes('ops_bash'), 'tools 分支含工具调用');
+  ok(!toolsOnly.report.includes('最近对方说的话'), 'tools 分支不含人类输入段落');
+
+  // 读不到目标会话（已删除 / inspect 抛错）时如实返回失败，而不是抛出去。
+  const gone = makeController({});
+  const { tools: tools2 } = await setup({
+    controller: gone,
+    name: 'p2',
+    seed: {
+      version: 2,
+      advisors: { 'caller-x': { createdAt: 1, title: '', slots: [{ sessionId: 'advisor-x', title: null, cwd: null, createdAt: 1, consults: 0, lastConsultAt: 0 }] } },
+    },
+  });
+  const missing = await tools2.get('advisor_watch').execute({}, { agent: { session: { id: 'advisor-x' } } });
+  eq(missing.ok, false, '目标会话读不到时返回 ok:false');
+  ok(typeof missing.error === 'string' && missing.error.length > 0, '失败时带上原因');
+
+  // ── 便条：写进主会话名下的队列，等它下次自己来读 ──
+  const wrote = await note.execute({ text: '那个超时是 set 在 socket 上的。' }, { agent: { session: { id: 'advisor-1' } } });
+  eq(wrote.ok, true, '顾问能留便条');
+  eq(wrote.deliveredTo, 'caller-1', '便条落在它辅助的主会话名下');
+  eq(wrote.pending, 1, '队列里有一条待读');
+
+  // 便条是挂在某个会话名下的，所以读的时候必须带上「我是谁」（exec.agent.session.id）。
+  // 注意返回值是**渲染好的文本**（renderNotes 的产物），不是数组——主会话直接把
+  // 它当自然语言读，所以这里断言的是内容而不是条数。
+  const asCaller = { agent: { session: { id: 'caller-1' } } };
+  const read1 = await tools.get('advisor_status').execute({}, asCaller);
+  ok(typeof read1.notes === 'string', '主会话调 advisor_status 就能读到便条');
+  ok(read1.notes.includes('socket'), '便条正文完整带回');
+
+  // 消费式：读过就清空，否则主会话每调一次工具都会重新看到同一批旧便条。
+  const read2 = await tools.get('advisor_status').execute({}, asCaller);
+  eq(read2.notes, null, '便条取走即清空（不会重复塞）');
+
+  // 上限丢最旧：长期不读的会话不该把状态文件和主会话上下文无限撑大。
+  // 便条是拼在一起的文本，数「第 N 条」这个小标题就知道留下了哪几条。
+  for (let i = 1; i <= 6; i += 1) {
+    await note.execute({ text: `第 ${i} 条` }, { agent: { session: { id: 'advisor-1' } } });
+  }
+  const read3 = await tools.get('advisor_status').execute({}, asCaller);
+  ok(!read3.notes.includes('第 1 条'), '超限时丢掉最旧的那条');
+  ok(read3.notes.includes('第 2 条'), '从第 2 条开始保留');
+  ok(read3.notes.includes('第 6 条'), '保留最新的一条');
+
+  // ask_advisor 也带便条（同一个 takeNotes）——主会话主动求助时同样能收到。
+  await note.execute({ text: '求助时顺带给你的一条。' }, { agent: { session: { id: 'advisor-1' } } });
+  const made = makeAgent({ id: 'advisor-1', answer: '看这里' });
+  teach(controller, made);
+  const asked = await tools.get('ask_advisor').execute(
+    { question: '问一句' },
+    { agent: { session: { id: 'caller-1' } } },
+  );
+  eq(asked.ok, true, '主会话仍能正常求助');
+  ok(asked.notes !== null && asked.notes.includes('顺带给你的一条'), 'ask_advisor 也会一并带回便条');
 }
 
 // ── 结果 ──────────────────────────────────────────────────────────────────

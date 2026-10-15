@@ -2,6 +2,8 @@
 
 > **A "second opinion" plugin for DeepSeek Harness** — when one session gets stuck, hand the problem to another **independent session** for a fresh look, then bring the answer back.
 > The asking session **waits synchronously** inside its own tool call and receives the advisor's answer **as a tool result**: no waking idle sessions, and no impersonating the user.
+>
+> The reverse direction works too: the user can **step into the advisor window** and have it check on the principal and leave a note — without interrupting the principal at all.
 
 English | [中文](README.md)
 
@@ -106,7 +108,7 @@ Four implementation decisions that matter:
 
 ---
 
-## Triggering (two routes)
+## Triggering (three routes)
 
 ### 1. The session realizes it is stuck → calls the tool itself
 
@@ -119,6 +121,13 @@ The `ask_advisor` description spells out when it applies, and the model decides:
 ### 2. The user says so → their words enter the context and the session calls the tool
 
 No configuration needed — "you're stuck, ask the advisor" is enough.
+
+### 3. The other way round: the user drives it from the advisor window
+
+A user who does not want to interrupt the principal's thinking can say "go see what it is
+doing" **inside the advisor session** — the advisor reads the live picture with
+`advisor_watch` and leaves a note with `advisor_note`, never touching the principal's
+context. The principal picks that note up the next time it calls a tool itself.
 
 > **Why not passively watch the behavior stream and intervene on detected loops?**
 > Because every step of a loop looks like progress from the inside — the session doing it
@@ -169,7 +178,61 @@ Inspects **this session's** advisors, or resets them.
 
 Returns `callerSessionId` / `callerTitle` / `advisors` (array; each entry has `slot`,
 `sessionId`, `title`, `cwd`, `live`, `consults`, `lastConsultAt`, `createdAt`) /
-`droppedAdvisorSessionIds` / `legacyAdvisorSessionId` / `maxAdvisors` / `stateFile`.
+`droppedAdvisorSessionIds` / `legacyAdvisorSessionId` / `maxAdvisors` / `stateFile` /
+`notes`.
+
+### `advisor_watch` (advisor-only)
+
+The two tools above run "asking session → advisor". This one and `advisor_note` run the
+**other way**: the user walks into the advisor window and says "go see what the principal
+is doing and lend a hand".
+
+It reports what **the principal session you advise** is doing right now: whether it is
+running, which step it stopped at, how long since it last asked for help, whether the
+topic has moved on, what was said recently, and which tools were called last.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `detail` | ⭕ | `summary` (default) for the full picture; `tools` for just the recent tool calls |
+
+**Strictly read-only.** It goes through `sessionController.inspect`, whose own comment
+says *without activating its Agent*: an attached session yields an in-memory snapshot, a
+cold one is read from persistence, and in both cases it **does not resume, does not wake
+the other side, and writes nothing into its log**. The running flag comes separately from
+`sessionController.list()` (also non-resuming). That is the technical guarantee behind
+"do not interrupt the principal's thinking".
+
+Returns `{ ok, principal: { sessionId, slot, title, running, cwd, lastActivityAt,
+idleMs, sinceLastConsultMs, topicMoved }, report, note }`. `report` is a prose picture
+meant for a human reader; when `running` cannot be determined it is `null` and the report
+says "run state unknown" — **it never defaults to running or idle, because that would be
+fabrication**.
+
+### `advisor_note` (advisor-only)
+
+Leaves a note for the principal session you advise. The principal sees it alongside the
+tool result the **next time** it calls `ask_advisor` or `advisor_status`, and thereby
+learns that you are watching and what you found.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `text` | ✅ | The note: what you observed, what you suggest, and your evidence |
+
+A note is **only a message**: it does not pop up, it does not alter the principal's
+ongoing thinking, and it is read only when the principal itself calls a tool next. So
+write the conclusion and the reasoning together — by the time the principal reads it, it
+may have moved on, and it has to be able to judge whether the note still applies.
+
+Notes are filed per **asking session**, capped at `maxNotes` (5 by default; the oldest is
+dropped — it is also the likeliest to be stale), and they are **consumed on read**: once
+the principal has seen them the queue is cleared, so a tool call does not re-show the same
+old notes.
+
+> **Who may call these two tools?** Only advisor sessions **created by this plugin** — it
+> looks the ownership up in `advisors[askingSession].slots[]` in the state file rather
+> than keeping a second record. Any other session gets an error (their whole semantics rest
+> on "I am assisting some principal"; opening them up would hand every session the ability
+> to snoop on others). A principal that needs help should use `ask_advisor`.
 
 ### How advisor sessions are named
 
@@ -213,6 +276,10 @@ therefore read only at runtime).
 | `stateFile` | `''` | State file path; empty means `$DSH_HOME/second-opinion/state.json` |
 | `advisorLabel` | `辅助` | Prefix for advisor session titles, followed by the asking session's first three characters |
 | `maxAdvisors` | `9` | Maximum number of advisor slots per asking session |
+| `maxWatchedTools` | `12` | How many tool calls `advisor_watch` lists (the count itself is always the full total) |
+| `maxReportChars` | `12000` | Character ceiling for the `advisor_watch` report |
+| `maxNotes` | `5` | Note-queue ceiling per asking session; the oldest is dropped past it |
+| `maxNoteChars` | `4000` | Character ceiling for a single note |
 
 Over-long content is truncated **with a visible marker**
 (`…(content too long, truncated, original N characters)`). Silent truncation would let a
@@ -234,13 +301,15 @@ model conclude from incomplete information believing it was complete.
 | Dependency | Required | Notes |
 | --- | --- | --- |
 | `ctx.sessionController` | ✅ | `create()` to make an advisor, `resolveAgent()` to revive an existing one |
-| `ctx.tools` | ✅ | Registers the two tools |
+| `ctx.tools` | ✅ | Registers the four tools |
 | `agent.followup(msg)` | ✅ | Delivers the consult request **and wakes the advisor** |
 | `agent.whenIdle()` / `agent.status` | ✅ | Waits for the advisor to finish |
 | `agent.session.seq` / `snapshotEvents(from)` | ✅ | Defines the answer boundary and reads the reply |
 | `ctx.agents.get(id)` | ⭕ optional | `advisor_status` uses it for `live`; consults work without it |
 | `ctx.sessionTitle.get(session)` | ⭕ optional | Reads the asking session's title as the naming source; falls back to the session id |
 | `sessionController.rename()` | ⭕ optional | Titles advisor sessions. Skipped on an older host that lacks it; consults still work |
+| `sessionController.inspect(id)` | ⭕ optional | `advisor_watch` reads the principal through it. **Read-only, does not resume the Agent**; without it the tool returns a failure |
+| `sessionController.list()` | ⭕ optional | `advisor_watch` reads `running` from it. Also non-resuming; if unavailable the report says "run state unknown" |
 | `@deepseek-ai/dsh-llm`'s `createUserMessage` | ⭕ optional | **Deliberately unused**: the package is not in the profile's `node_modules`. This plugin builds messages itself (see below) |
 
 **Zero runtime dependencies**: only `node:fs` / `node:os` / `node:path` / `node:crypto`
@@ -275,12 +344,13 @@ $DSH_HOME/second-opinion/state.json     # default; falls back to ~/.dsh when DSH
 ```
 
 State lives under `advisors`, keyed by the **asking session's id**; each entry holds
-`createdAt`, the last known asking title, and a `slots[]` array of advisor records
-(`sessionId`, `title`, `cwd`, `createdAt`, `consults`, `lastConsultAt`). Plus a `version`
-and, when upgrading from the old flat layout, a `legacyAdvisorSessionId` note. A corrupt
-file falls back to an empty table — the worst case is simply freshly created advisors.
-Deleting it means the next consult creates new advisors (the old sessions themselves
-remain).
+`createdAt`, the last known asking title, a `notes[]` queue (written by the advisor via
+`advisor_note`, read by the principal, cleared on read), and a `slots[]` array of advisor
+records (`sessionId`, `title`, `cwd`, `createdAt`, `consults`, `lastConsultAt`). Plus a
+`version` (currently `3`) and, when upgrading from the old flat layout, a
+`legacyAdvisorSessionId` note. A corrupt file falls back to an empty table — the worst case
+is simply freshly created advisors. Deleting it means the next consult creates new advisors
+(the old sessions themselves remain).
 
 ---
 
@@ -318,15 +388,20 @@ Self-tests (pure functions + a host mock, **no real DSH needed**):
 npm test        # = node test/selftest.mjs && node test/host-mock.mjs
 ```
 
-- `test/selftest.mjs` (67 assertions): `compose.js` pure functions — prompt assembly,
+- `test/selftest.mjs` (135 assertions): `compose.js` pure functions — prompt assembly,
   answer extraction (stream fallback, "empty messages must not swallow text"), truncation
-  markers, and **advisor title naming** (first three characters, slot numbers, emoji not
-  split in half, empty-title fallback).
-- `test/host-mock.mjs` (94 assertions): calls `apply()` for real against a fake ctx,
+  markers, **advisor title naming** (first three characters, slot numbers, emoji not
+  split in half, empty-title fallback), **human-readable time gaps** (`humanGap`),
+  **principal-session summarisation** (`summarizeSession`), **report rendering**
+  (`renderPrincipalReport`), and **note rendering** (`renderNotes`).
+- `test/host-mock.mjs` (133 assertions): calls `apply()` for real against a fake ctx,
   covering tool registration, normal answers, timeouts, empty answers, **recursion guard**,
   advisor revive failure, creation failure, **concurrent serialization**, **per-session
   advisors not interfering**, **titles only rewritten when they actually change**,
-  corrupt-state recovery, and legacy flat-state migration.
+  corrupt-state recovery, legacy flat-state migration, and the **two advisor-side tools**
+  (non-advisor calls refused, the `detail` branch, failure when the target session cannot
+  be read, note queueing with oldest-dropped cap, consume-on-read, and `ask_advisor`
+  carrying notes back too).
 
 It cannot replace a real session run (a fake agent does not actually think), but it pins
 down the **contract**: who throws, who returns an error object, and which event range the
