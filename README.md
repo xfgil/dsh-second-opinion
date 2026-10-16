@@ -238,8 +238,8 @@ idleMs, sinceLastConsultMs, topicMoved }, report, note }`。`report` 是给人�
 ## 配置
 
 写在 profile 的 `cordis.patch.yml` 里（**不会导出 Config schema**——profile 侧
-解析不到 schemastery，导出非 schema 对象会让 loader 投影 config 时报错，这是
-`dsh-onebot-guard` 踩过的坑，所以配置项只走运行时读取）。
+解析不到 schemastery，导出非 schema 对象会让 loader 投影 config 时报错，所以配置项
+只走运行时读取）。
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
@@ -267,7 +267,7 @@ idleMs, sinceLastConsultMs, topicMoved }, report, note }`。`report` 是给人�
 
 | 项 | 版本 |
 | --- | --- |
-| DSH | **0.2.0-rc.2**（本插件的开发与实测版本） |
+| DSH | **0.2.0-rc.2**（实测于该版本） |
 | Node（宿主内嵌） | >= 22（`package.json` 的 `engines`） |
 
 ### 依赖的宿主服务与接口
@@ -318,8 +318,8 @@ $DSH_HOME/second-opinion/state.json     # 默认；DSH_HOME 缺省时退回 ~/.d
 状态按**求助会话的 id** 归档在 `advisors` 下；每份档案记 `createdAt`、最近一次读到的
 求助方标题、`notes[]` 便条队列（顾问侧 `advisor_note` 写、主会话侧读，读过即清）、
 以及 `slots[]` 槽位数组（每项含 `sessionId` / `title` / `cwd` /
-`createdAt` / `consults` / `lastConsultAt`）。另有 `version`（当前 `3`），以及从旧版
-扁平结构升级时留下的 `legacyAdvisorSessionId` 痕迹。
+`createdAt` / `consults` / `lastConsultAt`）。另有 `version`（当前 `3`），以及从
+更早的扁平结构升级上来的会话留下的 `legacyAdvisorSessionId` 痕迹。
 
 文件损坏时按空表继续，最坏情况只是重新建顾问。删掉它 = 下次咨询新建顾问
 （旧会话本身还在）。
@@ -354,27 +354,6 @@ dsh plugin --profile <你的profile> add dsh-second-opinion
 3. 打开顾问会话，应该能看到一条自我介绍（`ADVISOR_INTRO`）和你的提问原文；
 4. 回到求助方，`answer` 字段就是顾问的回复正文。
 
-自测（纯函数 + 宿主 mock，**不需要真实 DSH**）：
-
-```bash
-npm test        # = node test/selftest.mjs && node test/host-mock.mjs
-```
-
-- `test/selftest.mjs`（135 项）：`compose.js` 的纯函数——提示词组装、
-  答案提取（含流式兜底与「空消息不吞正文」）、截断标记、**顾问标题命名**
-  （前三字、多槽位加号、emoji 不劈半、空标题回退）、**时间间隔的人话换算**
-  （`humanGap`）、**主会话实况归纳**（`summarizeSession`）、**实况报告渲染**
-  （`renderPrincipalReport`）、**便条渲染**（`renderNotes`）。
-- `test/host-mock.mjs`（133 项）：用假 ctx 真实调用 `apply()`，
-  覆盖工具注册、正常回答、超时、空回答、**递归保护**、顾问恢复失败、
-  创建失败、**并发串行排队**、**分会话顾问互不干扰**、**标题改名只在需要时发**、
-  状态文件损坏恢复、旧版扁平状态迁移、**顾问侧两个工具**
-  （非顾问调用被拒、`detail` 分支、读不到目标会话时的失败返回、便条排队与上限丢最旧、
-  取走即清空、`ask_advisor` 也带回便条）。
-
-它当然不能替代真实会话跑通（假的 agent 不会真的思考），但能钉住**契约**：
-谁抛错、谁返回错误对象、答案从哪段事件区间取。
-
 ---
 
 ## ⚠️ 自用免责声明
@@ -389,26 +368,6 @@ npm test        # = node test/selftest.mjs && node test/host-mock.mjs
   assistant 事件的 `message.content` / `stream` 结构。这些不是稳定 API，
   DSH 升级后**随时可能坏**。
 - 使用风险自负。因使用本插件造成的任何直接或间接损失，作者不承担责任。
-
----
-
-## 开发
-
-```
-lib/
-  index.js     # 主实现：顾问生命周期、咨询排队、等待、工具注册
-  compose.js   # 纯函数：提示词组装、答案提取、截断（可脱离宿主测试）
-test/
-  selftest.mjs   # compose.js 的单元测试
-  host-mock.mjs  # 假 ctx 下真实跑 apply()，覆盖 index.js
-cordis.patch.yml
-```
-
-- 零运行时依赖（只用 `node:` 内置模块）。
-- `lib/compose.js` 刻意与 `index.js` 分开，就是为了让最容易出错的
-  「答案提取」能脱离宿主被逐条钉住。
-- 本地热改的话，配合 [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader)
-  可以改完即生效、无需重启。
 
 ---
 

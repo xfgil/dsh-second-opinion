@@ -263,8 +263,7 @@ Naming goes through the host's `sessionController.rename`, which pins the title 
 
 Written in the profile's `cordis.patch.yml` (**no Config schema is exported** — the
 profile side cannot resolve schemastery, and exporting a non-schema object makes the
-loader fail while projecting config; a lesson from `dsh-onebot-guard`. Config keys are
-therefore read only at runtime).
+loader fail while projecting config; config keys are therefore read only at runtime).
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -293,7 +292,7 @@ model conclude from incomplete information believing it was complete.
 
 | Item | Version |
 | --- | --- |
-| DSH | **0.2.0-rc.2** (developed and tested against) |
+| DSH | **0.2.0-rc.2** (tested against this version) |
 | Node (embedded in host) | >= 22 (`engines` in `package.json`) |
 
 ### Host services and interfaces used
@@ -347,7 +346,7 @@ State lives under `advisors`, keyed by the **asking session's id**; each entry h
 `createdAt`, the last known asking title, a `notes[]` queue (written by the advisor via
 `advisor_note`, read by the principal, cleared on read), and a `slots[]` array of advisor
 records (`sessionId`, `title`, `cwd`, `createdAt`, `consults`, `lastConsultAt`). Plus a
-`version` (currently `3`) and, when upgrading from the old flat layout, a
+`version` (currently `3`) and, for sessions upgraded from an earlier flat layout, a
 `legacyAdvisorSessionId` note. A corrupt file falls back to an empty table — the worst case
 is simply freshly created advisors. Deleting it means the next consult creates new advisors
 (the old sessions themselves remain).
@@ -382,31 +381,6 @@ Minimal flow (you do not have to be genuinely stuck):
 3. Open the advisor session; you should see a self-introduction (`ADVISOR_INTRO`) and your question;
 4. Back in the asking session, `answer` holds the advisor's reply text.
 
-Self-tests (pure functions + a host mock, **no real DSH needed**):
-
-```bash
-npm test        # = node test/selftest.mjs && node test/host-mock.mjs
-```
-
-- `test/selftest.mjs` (135 assertions): `compose.js` pure functions — prompt assembly,
-  answer extraction (stream fallback, "empty messages must not swallow text"), truncation
-  markers, **advisor title naming** (first three characters, slot numbers, emoji not
-  split in half, empty-title fallback), **human-readable time gaps** (`humanGap`),
-  **principal-session summarisation** (`summarizeSession`), **report rendering**
-  (`renderPrincipalReport`), and **note rendering** (`renderNotes`).
-- `test/host-mock.mjs` (133 assertions): calls `apply()` for real against a fake ctx,
-  covering tool registration, normal answers, timeouts, empty answers, **recursion guard**,
-  advisor revive failure, creation failure, **concurrent serialization**, **per-session
-  advisors not interfering**, **titles only rewritten when they actually change**,
-  corrupt-state recovery, legacy flat-state migration, and the **two advisor-side tools**
-  (non-advisor calls refused, the `detail` branch, failure when the target session cannot
-  be read, note queueing with oldest-dropped cap, consume-on-read, and `ask_advisor`
-  carrying notes back too).
-
-It cannot replace a real session run (a fake agent does not actually think), but it pins
-down the **contract**: who throws, who returns an error object, and which event range the
-answer is read from.
-
 ---
 
 ## ⚠️ Personal-use disclaimer
@@ -423,27 +397,6 @@ answer is read from.
   events. These are not stable APIs and **may break at any time** after a DSH upgrade.
 - Use at your own risk. The author accepts no liability for any direct or indirect
   damages arising from use of this plugin.
-
----
-
-## Development
-
-```
-lib/
-  index.js     # main: advisor lifecycle, consult queue, waiting, tool registration
-  compose.js   # pure functions: prompt assembly, answer extraction, truncation (testable without the host)
-test/
-  selftest.mjs   # unit tests for compose.js
-  host-mock.mjs  # runs apply() for real against a fake ctx, covering index.js
-cordis.patch.yml
-```
-
-- Zero runtime dependencies (only `node:` builtins).
-- `lib/compose.js` is deliberately split from `index.js` so the most error-prone part
-  ("answer extraction") can be pinned down assertion by assertion without the host.
-- For live edits while developing, pair it with
-  [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) to apply changes
-  without restarting.
 
 ---
 
